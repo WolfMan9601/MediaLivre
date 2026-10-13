@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QScrollArea,
 )
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -225,8 +226,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} · Transferências de media")
-        self.setMinimumSize(760, 700)
-        self.resize(940, 850)
+        self.setMinimumSize(680, 520)
+        self.resize(940, 760)
         self.thread: QThread | None = None
         self.worker: DownloadWorker | None = None
         self._active_schedule_id: str | None = None
@@ -243,11 +244,18 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._run_due_schedules)
 
     def _build_ui(self) -> None:
+        scroll = QScrollArea()
+        scroll.setObjectName("mainScrollArea")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         root = QWidget()
-        self.setCentralWidget(root)
+        root.setObjectName("pageContent")
+        scroll.setWidget(root)
+        self.setCentralWidget(scroll)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(30, 26, 30, 22)
-        layout.setSpacing(16)
+        layout.setContentsMargins(24, 18, 24, 18)
+        layout.setSpacing(12)
 
         header = QHBoxLayout()
         brand = QVBoxLayout()
@@ -340,8 +348,14 @@ class MainWindow(QMainWindow):
         schedule_row.addWidget(self.schedule_button)
         schedule_layout.addLayout(schedule_row)
         self.scheduled_list = QListWidget()
+        self.scheduled_list.setObjectName("scheduledList")
+        self.scheduled_list.setMinimumHeight(58)
         self.scheduled_list.setMaximumHeight(95)
         self.scheduled_list.currentItemChanged.connect(self._update_schedule_actions)
+        self.schedule_empty_label = QLabel("Nenhum download agendado.")
+        self.schedule_empty_label.setObjectName("emptyState")
+        self.schedule_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        schedule_layout.addWidget(self.schedule_empty_label)
         schedule_layout.addWidget(self.scheduled_list)
         schedule_actions = QHBoxLayout()
         self.cancel_schedule_button = QPushButton("Cancelar agendamento selecionado")
@@ -406,6 +420,7 @@ class MainWindow(QMainWindow):
         self.log.setReadOnly(True)
         self.log.setPlaceholderText("O progresso e as mensagens da transferência aparecem aqui.")
         self.log.document().setMaximumBlockCount(250)
+        self.log.setMinimumHeight(105)
         layout.addWidget(self.log, 1)
 
         notice = QLabel(
@@ -465,6 +480,9 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole + 1, job.state)
             item.setToolTip(job.last_error or job.url)
             self.scheduled_list.addItem(item)
+        has_jobs = self.scheduled_list.count() > 0
+        self.schedule_empty_label.setVisible(not has_jobs)
+        self.scheduled_list.setVisible(has_jobs)
         self._update_schedule_actions(self.scheduled_list.currentItem(), None)
 
     @Slot(object, object)
@@ -514,15 +532,27 @@ class MainWindow(QMainWindow):
 
     def _apply_style(self) -> None:
         self.setStyleSheet("""
-            QMainWindow, QWidget { background: #10151c; color: #e7edf5; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
+            QMainWindow { background: #10151c; color: #e7edf5; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
+            QWidget#pageContent { background: #10151c; color: #e7edf5; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
+            QScrollArea#mainScrollArea { background: #10151c; border: 0; }
             QLabel#title { color: #f5f8fc; font-size: 29px; font-weight: 700; }
             QLabel#subtitle { color: #95a4b6; font-size: 14px; }
             QLabel#version { color: #91a7bd; font-size: 10px; font-weight: 700; letter-spacing: 1px; padding: 8px; }
             QFrame#card { background: #171f29; border: 1px solid #293543; border-radius: 12px; }
             QLabel#fieldLabel { color: #93a7bb; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
-            QLineEdit, QComboBox { background: #0e141b; border: 1px solid #344253; border-radius: 7px; padding: 10px 11px; color: #f1f5f9; selection-background-color: #2384df; }
+            QLineEdit, QComboBox, QDateTimeEdit { background: #0e141b; border: 1px solid #344253; border-radius: 7px; padding: 8px 10px; color: #f1f5f9; selection-background-color: #2384df; min-height: 20px; }
             QLineEdit:focus, QComboBox:focus { border: 1px solid #3b9aff; }
             QComboBox::drop-down { border: 0; width: 26px; }
+            QDateTimeEdit::drop-down { border: 0; width: 28px; }
+            QListWidget#scheduledList { background: #0b1016; border: 1px solid #293543; border-radius: 7px; padding: 4px; color: #b9c7d5; outline: 0; }
+            QListWidget#scheduledList::item { padding: 7px 8px; border-radius: 4px; }
+            QListWidget#scheduledList::item:hover { background: #172536; }
+            QListWidget#scheduledList::item:selected { background: #1b5f99; color: #ffffff; }
+            QLabel#emptyState { color: #718397; padding: 9px; }
+            QScrollBar:vertical { background: #10151c; width: 12px; margin: 0; }
+            QScrollBar::handle:vertical { background: #344253; min-height: 28px; border-radius: 5px; }
+            QScrollBar::handle:vertical:hover { background: #4b6075; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
             QPushButton { background: #222d39; border: 1px solid #354455; border-radius: 7px; padding: 10px 14px; color: #eef4fa; font-weight: 600; }
             QPushButton:hover { background: #2c3b4b; }
             QPushButton:disabled { color: #69798a; background: #1a222c; }

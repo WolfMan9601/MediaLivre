@@ -7,6 +7,7 @@ Aplicação desktop de código aberto para gerir transferências de vídeo e áu
 ## Funcionalidades do protótipo
 
 - Interface desktop Qt em português.
+- Layout com rolagem vertical adaptável a ecrãs pequenos, evitando que os controlos fiquem cortados.
 - Transferência individual ou, com opção explícita, playlists e URLs de canais reconhecidas pelo yt-dlp.
 - Escolha de qualidade: melhor disponível, 1080p, 720p ou 480p.
 - Escolha do contêiner de vídeo: automático, MP4, MKV ou AVI.
@@ -55,7 +56,9 @@ Instale FFmpeg separadamente e confirme que `ffmpeg.exe` está no `PATH` para á
 
 Na lista **Formato do vídeo**, MP4 restringe a seleção a streams compatíveis com MP4; MKV converte/remuxa para Matroska; AVI usa vídeo Xvid e áudio MP3, quando os encoders FFmpeg necessários estão disponíveis. MKV/AVI e MP3 precisam de FFmpeg. A conversão AVI reencoda vídeo e áudio, pode demorar mais e pode reduzir a qualidade; MKV/MP4 tentam preservar os streams quando possível.
 
-Para gerar o executável Windows a partir de uma máquina Windows, execute `build_windows.bat` na pasta do projeto. O script instala PyInstaller no ambiente virtual e cria a versão em pasta em `dist\MediaLivre\MediaLivre.exe`. FFmpeg continua a ser instalado separadamente. O script de build ainda não foi executado neste ambiente Linux.
+Para gerar o instalador Windows a partir de uma máquina Windows, instale o Python 3.10+ de 64 bits e o Inno Setup 6 e execute `create_installer_windows.bat`. O script compila com PyInstaller e em seguida usa `installer_windows.iss`; o instalador final ficará em `dist\installer\MediaLivre-Setup-0.4.0-win64.exe`. FFmpeg continua a ser instalado separadamente. Este build Windows não foi executado nem verificado neste ambiente Linux. Consulte [`INSTALAR_WINDOWS.md`](INSTALAR_WINDOWS.md).
+
+Se apenas precisar de compilar a aplicação, execute `build_windows.bat`; cria `dist\MediaLivre\MediaLivre.exe` com os ficheiros de runtime adjacentes.
 
 Para compilar manualmente no PowerShell, a partir da pasta do projeto:
 
