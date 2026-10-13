@@ -9,3 +9,4 @@ dist/
 Thumbs.db
 third_party/ffmpeg/bin/*
 third_party/ffmpeg/licenses/*
+MediaLivre-Setup-*.exe
