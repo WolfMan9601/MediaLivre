@@ -1,5 +1,5 @@
 #define AppName "MediaLivre"
-#define AppVersion "0.4.0"
+#define AppVersion "0.5.0"
 #define AppPublisher "MediaLivre contributors"
 #define AppExeName "MediaLivre.exe"
 
@@ -20,6 +20,7 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64
 UninstallDisplayIcon={app}\{#AppExeName}
+SetupIconFile=assets\medialivre.ico
 SetupLogging=yes
 
 [Languages]
@@ -32,8 +33,8 @@ Name: "desktopicon"; Description: "Criar um atalho no Ambiente de Trabalho"; Gro
 Source: "dist\MediaLivre\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\medialivre.ico"; WorkingDir: "{app}"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\medialivre.ico"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Iniciar o {#AppName}"; Flags: postinstall nowait skipifsilent

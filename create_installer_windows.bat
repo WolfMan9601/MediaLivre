@@ -21,4 +21,4 @@ if not exist "%ISCC_EXE%" (
 if errorlevel 1 exit /b 1
 
 echo.
-echo Instalador criado em dist\installer\MediaLivre-Setup-0.4.0-win64.exe
+echo Instalador criado em dist\installer\MediaLivre-Setup-0.5.0-win64.exe

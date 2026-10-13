@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QUrl, QDateTime, QTimer, QLockFile
-from PySide6.QtGui import QDesktopServices, QFont
+from PySide6.QtGui import QDesktopServices, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -36,7 +36,13 @@ from yt_dlp.utils import DownloadError
 from download_scheduler import ScheduleStore, ScheduledDownload, default_database_path
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
+
+
+def resource_path(*parts: str) -> Path:
+    """Locate bundled resources both from source and from a PyInstaller build."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base.joinpath(*parts)
 
 
 def is_http_url(value: str) -> bool:
@@ -51,6 +57,51 @@ def is_http_url(value: str) -> bool:
         )
     except ValueError:
         return False
+
+
+def is_collection_url(value: str) -> bool:
+    """Detect playlist/channel URLs so a valid collection is not reduced to one item."""
+    try:
+        parsed = urlparse(value.strip())
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return False
+        path = parsed.path.lower().rstrip("/")
+        query = parsed.query.lower()
+        collection_path = (
+            "/playlist" in path
+            or "/channel/" in path
+            or path.startswith("/c/")
+            or path.startswith("/user/")
+            or path.startswith("/@")
+        )
+        return collection_path or "list=" in query
+    except ValueError:
+        return False
+
+
+def playlist_enabled(url: str, requested: bool) -> bool:
+    """Keep an explicit user request or auto-enable collection URLs."""
+    return bool(requested or is_collection_url(url))
+
+
+def ffmpeg_location() -> Path | None:
+    """Find the bundled FFmpeg directory before falling back to PATH."""
+    candidates: list[Path] = []
+    configured = os.environ.get("MEDIALIVRE_FFMPEG_DIR")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend([
+        Path(sys.executable).resolve().parent / "ffmpeg" / "bin",
+        resource_path("ffmpeg", "bin"),
+        resource_path("third_party", "ffmpeg", "bin"),
+        Path(__file__).resolve().parent / "third_party" / "ffmpeg" / "bin",
+    ])
+    for candidate in candidates:
+        if (candidate / "ffmpeg.exe").is_file() and (candidate / "ffprobe.exe").is_file():
+            return candidate
+        if (candidate / "ffmpeg").is_file() and (candidate / "ffprobe").is_file():
+            return candidate
+    return None
 
 
 def quality_format(quality: str, audio_only: bool, container: str = "Automático") -> str:
@@ -166,10 +217,11 @@ class DownloadWorker(QObject):
     def run(self) -> None:
         try:
             self.destination.mkdir(parents=True, exist_ok=True)
+            collection_enabled = playlist_enabled(self.url, self.allow_playlist)
             options: dict = {
                 "format": quality_format(self.quality, self.audio_only, self.container),
                 "outtmpl": str(self.destination / "%(title).180B [%(id)s].%(ext)s"),
-                "noplaylist": not self.allow_playlist,
+                "noplaylist": not collection_enabled,
                 "windowsfilenames": True,
                 "restrictfilenames": False,
                 "continuedl": True,
@@ -183,6 +235,15 @@ class DownloadWorker(QObject):
                 "retries": 3,
                 "fragment_retries": 3,
             }
+            if collection_enabled:
+                # Explicitly request the complete collection, not only the first entry.
+                options["playlist_items"] = "1-"
+                self.log_line.emit("Playlist/canal detetado: a preparar todos os itens disponíveis…")
+            location = ffmpeg_location()
+            if location:
+                options["ffmpeg_location"] = str(location)
+            elif self.container != "Automático" or self.audio_only:
+                self.log_line.emit("Aviso: FFmpeg/ffprobe não encontrado; conversão de formato pode falhar.")
             if self.audio_only:
                 options["postprocessors"] = [{
                     "key": "FFmpegExtractAudio",
@@ -324,8 +385,11 @@ class MainWindow(QMainWindow):
         dest_row.addWidget(self.browse_button)
         card_layout.addLayout(dest_row)
 
-        self.playlist_check = QCheckBox("Transferir playlists e canais completos (pode incluir muitos vídeos)")
-        self.playlist_check.setChecked(False)
+        self.playlist_check = QCheckBox("Transferir playlists e canais completos automaticamente")
+        self.playlist_check.setChecked(True)
+        self.playlist_check.setToolTip(
+            "URLs de playlist/canal são detetados automaticamente. Desmarque para limitar uma URL com lista ao vídeo atual."
+        )
         card_layout.addWidget(self.playlist_check)
         layout.addWidget(card)
 
@@ -538,33 +602,33 @@ class MainWindow(QMainWindow):
             QLabel#title { color: #f5f8fc; font-size: 29px; font-weight: 700; }
             QLabel#subtitle { color: #95a4b6; font-size: 14px; }
             QLabel#version { color: #91a7bd; font-size: 10px; font-weight: 700; letter-spacing: 1px; padding: 8px; }
-            QFrame#card { background: #171f29; border: 1px solid #293543; border-radius: 12px; }
-            QLabel#fieldLabel { color: #93a7bb; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
-            QLineEdit, QComboBox, QDateTimeEdit { background: #0e141b; border: 1px solid #344253; border-radius: 7px; padding: 8px 10px; color: #f1f5f9; selection-background-color: #2384df; min-height: 20px; }
-            QLineEdit:focus, QComboBox:focus { border: 1px solid #3b9aff; }
+            QFrame#card { background: #171d32; border: 1px solid #303d6c; border-radius: 12px; }
+            QLabel#fieldLabel { color: #f1bd36; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
+            QLineEdit, QComboBox, QDateTimeEdit { background: #0e1426; border: 1px solid #35436f; border-radius: 7px; padding: 8px 10px; color: #f1f5f9; selection-background-color: #eaa22f; min-height: 20px; }
+            QLineEdit:focus, QComboBox:focus, QDateTimeEdit:focus { border: 1px solid #ffc61b; }
             QComboBox::drop-down { border: 0; width: 26px; }
             QDateTimeEdit::drop-down { border: 0; width: 28px; }
             QListWidget#scheduledList { background: #0b1016; border: 1px solid #293543; border-radius: 7px; padding: 4px; color: #b9c7d5; outline: 0; }
             QListWidget#scheduledList::item { padding: 7px 8px; border-radius: 4px; }
             QListWidget#scheduledList::item:hover { background: #172536; }
-            QListWidget#scheduledList::item:selected { background: #1b5f99; color: #ffffff; }
+            QListWidget#scheduledList::item:selected { background: #293b7a; color: #ffffff; }
             QLabel#emptyState { color: #718397; padding: 9px; }
             QScrollBar:vertical { background: #10151c; width: 12px; margin: 0; }
             QScrollBar::handle:vertical { background: #344253; min-height: 28px; border-radius: 5px; }
             QScrollBar::handle:vertical:hover { background: #4b6075; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-            QPushButton { background: #222d39; border: 1px solid #354455; border-radius: 7px; padding: 10px 14px; color: #eef4fa; font-weight: 600; }
-            QPushButton:hover { background: #2c3b4b; }
-            QPushButton:disabled { color: #69798a; background: #1a222c; }
-            QPushButton#primary { background: #1878d1; border: 1px solid #2589e5; color: white; }
-            QPushButton#primary:hover { background: #278be5; }
+            QPushButton { background: #202b55; border: 1px solid #3b4d88; border-radius: 7px; padding: 10px 14px; color: #eef4fa; font-weight: 600; }
+            QPushButton:hover { background: #2d3c73; border-color: #ffc61b; }
+            QPushButton:disabled { color: #69798a; background: #1a2034; }
+            QPushButton#primary { background: #eaa22f; border: 1px solid #ffc61b; color: #151b38; }
+            QPushButton#primary:hover { background: #ffc61b; }
             QCheckBox { color: #c2ceda; spacing: 8px; }
             QCheckBox::indicator { width: 17px; height: 17px; }
-            QProgressBar { background: #1c2732; border: 0; border-radius: 4px; min-height: 9px; max-height: 9px; }
-            QProgressBar::chunk { background: #29a0ff; border-radius: 4px; }
-            QTextEdit { background: #0b1016; border: 1px solid #293543; border-radius: 8px; padding: 10px; color: #aebdcb; font-family: Consolas, monospace; font-size: 11px; }
+            QProgressBar { background: #1a2442; border: 0; border-radius: 4px; min-height: 9px; max-height: 9px; }
+            QProgressBar::chunk { background: #ffc61b; border-radius: 4px; }
+            QTextEdit { background: #0b1016; border: 1px solid #303d6c; border-radius: 8px; padding: 10px; color: #c4cede; font-family: Consolas, monospace; font-size: 11px; }
             QLabel#status { color: #aebdcb; }
-            QLabel#percent { color: #70bdff; font-weight: 700; }
+            QLabel#percent { color: #ffc61b; font-weight: 700; }
             QLabel#itemLabel { color: #c2ceda; }
             QLabel#notice { color: #8697a8; font-size: 11px; }
         """)
@@ -738,6 +802,9 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setFont(QFont("Segoe UI", 10))
+    icon_path = resource_path("assets", "medialivre.ico")
+    if icon_path.is_file():
+        app.setWindowIcon(QIcon(str(icon_path)))
     database_path = default_database_path()
     database_path.parent.mkdir(parents=True, exist_ok=True)
     instance_lock = QLockFile(str(database_path.parent / "medialivre-instance.lock"))
@@ -750,6 +817,8 @@ def main() -> int:
         )
         return 0
     window = MainWindow()
+    if icon_path.is_file():
+        window.setWindowIcon(QIcon(str(icon_path)))
     window._instance_lock = instance_lock
     window.show()
     return app.exec()

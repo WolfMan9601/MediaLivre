@@ -1,7 +1,15 @@
 import unittest
 from pathlib import Path
 
-from medialivre import DownloadWorker, container_options, is_http_url, progress_details, quality_format
+from medialivre import (
+    DownloadWorker,
+    container_options,
+    is_collection_url,
+    is_http_url,
+    playlist_enabled,
+    progress_details,
+    quality_format,
+)
 
 
 class UrlValidationTests(unittest.TestCase):
@@ -18,6 +26,23 @@ class UrlValidationTests(unittest.TestCase):
         self.assertFalse(is_http_url("https:///missing-host"))
         self.assertFalse(is_http_url("https://user:password@example.com/video"))
         self.assertFalse(is_http_url(""))
+
+    def test_detects_youtube_playlist_and_channel_urls(self):
+        collection_urls = [
+            "https://www.youtube.com/playlist?list=PL123",
+            "https://www.youtube.com/watch?v=abc&list=PL123",
+            "https://www.youtube.com/@artist/videos",
+            "https://www.youtube.com/channel/UC123",
+            "https://www.youtube.com/c/artist",
+            "https://www.youtube.com/user/artist",
+        ]
+        for url in collection_urls:
+            with self.subTest(url=url):
+                self.assertTrue(is_collection_url(url))
+        self.assertFalse(is_collection_url("https://www.youtube.com/watch?v=abc"))
+        self.assertTrue(playlist_enabled("https://www.youtube.com/playlist?list=PL123", False))
+        self.assertTrue(playlist_enabled("https://www.youtube.com/watch?v=abc", True))
+        self.assertFalse(playlist_enabled("https://www.youtube.com/watch?v=abc", False))
 
 
 class FormatSelectionTests(unittest.TestCase):
