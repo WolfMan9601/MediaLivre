@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QUrl
+from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QUrl, QDateTime, QTimer, QLockFile
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -21,15 +23,19 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QCheckBox,
+    QDateTimeEdit,
+    QListWidget,
+    QListWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
+from download_scheduler import ScheduleStore, ScheduledDownload, default_database_path
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 
 
 def is_http_url(value: str) -> bool:
@@ -219,14 +225,22 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} · Transferências de media")
-        self.setMinimumSize(760, 640)
-        self.resize(900, 720)
+        self.setMinimumSize(760, 700)
+        self.resize(940, 850)
         self.thread: QThread | None = None
         self.worker: DownloadWorker | None = None
+        self._active_schedule_id: str | None = None
         self._close_when_idle = False
         self.destination = Path.home() / "Downloads"
+        self.schedule_store = ScheduleStore()
+        self.schedule_store.recover_interrupted_jobs()
         self._build_ui()
         self._apply_style()
+        self._refresh_scheduled_jobs()
+        self.schedule_timer = QTimer(self)
+        self.schedule_timer.timeout.connect(self._run_due_schedules)
+        self.schedule_timer.start(5000)
+        QTimer.singleShot(0, self._run_due_schedules)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -262,7 +276,7 @@ class MainWindow(QMainWindow):
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("https://…")
         self.url_input.setClearButtonEnabled(True)
-        self.url_input.returnPressed.connect(self.start_download)
+        self.url_input.returnPressed.connect(lambda: self.start_download())
         card_layout.addWidget(self.url_input)
 
         controls = QHBoxLayout()
@@ -307,10 +321,41 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.playlist_check)
         layout.addWidget(card)
 
+        schedule_card = QFrame()
+        schedule_card.setObjectName("card")
+        schedule_layout = QVBoxLayout(schedule_card)
+        schedule_layout.setContentsMargins(16, 12, 16, 12)
+        schedule_layout.setSpacing(8)
+        schedule_title = QLabel("AGENDAMENTO · HORA LOCAL")
+        schedule_title.setObjectName("fieldLabel")
+        schedule_layout.addWidget(schedule_title)
+        schedule_row = QHBoxLayout()
+        self.schedule_time = QDateTimeEdit(QDateTime.currentDateTime().addSecs(3600))
+        self.schedule_time.setCalendarPopup(True)
+        self.schedule_time.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self.schedule_time.setMinimumDateTime(QDateTime.currentDateTime().addSecs(30))
+        self.schedule_button = QPushButton("Agendar este download")
+        self.schedule_button.clicked.connect(self._schedule_current_download)
+        schedule_row.addWidget(self.schedule_time, 1)
+        schedule_row.addWidget(self.schedule_button)
+        schedule_layout.addLayout(schedule_row)
+        self.scheduled_list = QListWidget()
+        self.scheduled_list.setMaximumHeight(95)
+        self.scheduled_list.currentItemChanged.connect(self._update_schedule_actions)
+        schedule_layout.addWidget(self.scheduled_list)
+        schedule_actions = QHBoxLayout()
+        self.cancel_schedule_button = QPushButton("Cancelar agendamento selecionado")
+        self.cancel_schedule_button.setEnabled(False)
+        self.cancel_schedule_button.clicked.connect(self._cancel_selected_schedule)
+        schedule_actions.addStretch()
+        schedule_actions.addWidget(self.cancel_schedule_button)
+        schedule_layout.addLayout(schedule_actions)
+        layout.addWidget(schedule_card)
+
         action_row = QHBoxLayout()
         self.start_button = QPushButton("Iniciar transferência")
         self.start_button.setObjectName("primary")
-        self.start_button.clicked.connect(self.start_download)
+        self.start_button.clicked.connect(lambda _checked=False: self.start_download())
         self.cancel_button = QPushButton("Cancelar")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_download)
@@ -371,6 +416,102 @@ class MainWindow(QMainWindow):
         notice.setWordWrap(True)
         layout.addWidget(notice)
 
+    def _schedule_current_download(self) -> None:
+        url = self.url_input.text().strip()
+        if not is_http_url(url):
+            QMessageBox.warning(self, "Ligação inválida", "Introduza uma ligação HTTP(S) antes de agendar.")
+            return
+        run_at = datetime.fromtimestamp(
+            self.schedule_time.dateTime().toSecsSinceEpoch(), timezone.utc
+        )
+        if run_at <= datetime.now(timezone.utc):
+            QMessageBox.warning(self, "Horário inválido", "Escolha uma data/hora futura.")
+            return
+        options = {
+            "quality": self.quality.currentText(),
+            "container": self.video_format.currentText(),
+            "audio_only": self.audio_only.isChecked(),
+            "allow_playlist": self.playlist_check.isChecked(),
+            "destination": str(self.destination),
+        }
+        try:
+            job = self.schedule_store.add(url, run_at, options)
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+            QMessageBox.critical(self, "Não foi possível agendar", str(exc))
+            return
+        self._refresh_scheduled_jobs()
+        self._append_log(f"Agendado para {job.run_at_local:%Y-%m-%d %H:%M} (hora local): {url}")
+        QMessageBox.information(
+            self,
+            "Download agendado",
+            "O trabalho foi guardado neste computador. O MediaLivre irá executá-lo quando chegar a hora, "
+            "se estiver aberto; se for fechado, tentará iniciá-lo na próxima vez que abrir.",
+        )
+
+    def _refresh_scheduled_jobs(self) -> None:
+        self.scheduled_list.clear()
+        state_labels = {
+            "pending": "PENDENTE",
+            "running": "EM EXECUÇÃO",
+            "completed": "CONCLUÍDO",
+            "failed": "FALHOU",
+            "cancelled": "CANCELADO",
+        }
+        for job in self.schedule_store.list_recent(40):
+            when = job.run_at_local.strftime("%Y-%m-%d %H:%M")
+            url = job.url if len(job.url) <= 58 else job.url[:55] + "…"
+            item = QListWidgetItem(f"{when} · {state_labels.get(job.state, job.state)} · {url}")
+            item.setData(Qt.ItemDataRole.UserRole, job.id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, job.state)
+            item.setToolTip(job.last_error or job.url)
+            self.scheduled_list.addItem(item)
+        self._update_schedule_actions(self.scheduled_list.currentItem(), None)
+
+    @Slot(object, object)
+    def _update_schedule_actions(self, current, _previous) -> None:
+        can_cancel = bool(
+            current
+            and current.data(Qt.ItemDataRole.UserRole + 1) == "pending"
+        )
+        self.cancel_schedule_button.setEnabled(can_cancel)
+
+    @Slot()
+    def _cancel_selected_schedule(self) -> None:
+        item = self.scheduled_list.currentItem()
+        if not item:
+            return
+        job_id = item.data(Qt.ItemDataRole.UserRole)
+        if self.schedule_store.cancel(job_id):
+            self._append_log("Agendamento pendente cancelado.")
+            self._refresh_scheduled_jobs()
+
+    def _run_due_schedules(self) -> None:
+        if self._active_schedule_id or (self.thread and self.thread.isRunning()):
+            return
+        try:
+            job = self.schedule_store.claim_next_due()
+        except Exception as exc:
+            self._append_log(f"Erro ao consultar a fila de agendamentos: {exc}")
+            return
+        if job is None:
+            return
+        self._refresh_scheduled_jobs()
+        self._append_log(f"A iniciar agendamento {job.id}.")
+        self.start_download(job)
+
+    def _finish_active_schedule(self, state: str, error: str | None = None) -> None:
+        if not self._active_schedule_id:
+            return
+        try:
+            self.schedule_store.finish(self._active_schedule_id, state, error)
+        except sqlite3.Error as exc:
+            self._append_log(f"Não foi possível guardar o estado do agendamento: {exc}")
+        self._active_schedule_id = None
+        try:
+            self._refresh_scheduled_jobs()
+        except sqlite3.Error as exc:
+            self._append_log(f"Não foi possível atualizar a lista de agendamentos: {exc}")
+
     def _apply_style(self) -> None:
         self.setStyleSheet("""
             QMainWindow, QWidget { background: #10151c; color: #e7edf5; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
@@ -411,11 +552,27 @@ class MainWindow(QMainWindow):
             self.destination_text.setText(selected)
 
     @Slot()
-    def start_download(self) -> None:
-        url = self.url_input.text().strip()
+    def start_download(self, scheduled_job: ScheduledDownload | None = None) -> None:
+        if scheduled_job:
+            options = scheduled_job.options
+            self.url_input.setText(scheduled_job.url)
+            self.quality.setCurrentText(str(options.get("quality", "Melhor disponível")))
+            self.video_format.setCurrentText(str(options.get("container", "Automático")))
+            self.audio_only.setChecked(bool(options.get("audio_only", False)))
+            self.playlist_check.setChecked(bool(options.get("allow_playlist", False)))
+            self.destination = Path(options.get("destination") or self.destination)
+            self.destination_text.setText(str(self.destination))
+        self._active_schedule_id = scheduled_job.id if scheduled_job else None
+        url = scheduled_job.url if scheduled_job else self.url_input.text().strip()
         if not is_http_url(url):
-            QMessageBox.warning(self, "Ligação inválida", "Introduza uma ligação completa http:// ou https://.")
-            self.url_input.setFocus()
+            if scheduled_job:
+                self.schedule_store.finish(scheduled_job.id, "failed", "A URL guardada não é válida.")
+                self._active_schedule_id = None
+                self._refresh_scheduled_jobs()
+                self._append_log("Agendamento ignorado: a URL guardada não é válida.")
+            else:
+                QMessageBox.warning(self, "Ligação inválida", "Introduza uma ligação completa http:// ou https://.")
+                self.url_input.setFocus()
             return
         if self.thread and self.thread.isRunning():
             return
@@ -482,18 +639,21 @@ class MainWindow(QMainWindow):
         self.percent_label.setText("100%")
         self.status_label.setText("Transferência concluída")
         self._append_log(f"Concluído. Pasta: {folder}")
+        self._finish_active_schedule("completed")
         self._set_busy(False)
 
     @Slot(str)
     def _on_failed(self, message: str) -> None:
         self.status_label.setText("A transferência não foi concluída")
         self._append_log(message)
+        self._finish_active_schedule("failed", message)
         self._set_busy(False)
 
     @Slot()
     def _on_cancelled(self) -> None:
         self.status_label.setText("Transferência cancelada")
         self._append_log("A transferência foi cancelada.")
+        self._finish_active_schedule("cancelled")
         self._set_busy(False)
 
     @Slot()
@@ -548,7 +708,19 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setFont(QFont("Segoe UI", 10))
+    database_path = default_database_path()
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    instance_lock = QLockFile(str(database_path.parent / "medialivre-instance.lock"))
+    instance_lock.setStaleLockTime(30_000)
+    if not instance_lock.tryLock(0):
+        QMessageBox.information(
+            None,
+            "MediaLivre já está aberto",
+            "Já existe uma instância do MediaLivre em execução. Use essa janela para gerir os downloads agendados.",
+        )
+        return 0
     window = MainWindow()
+    window._instance_lock = instance_lock
     window.show()
     return app.exec()
 
