@@ -13,7 +13,7 @@ O instalador Windows precisa de ser compilado no Windows. Nesta sessão Linux n�
    - Compila `installer_windows.iss` com Inno Setup.
 4. O ficheiro final será `dist\installer\MediaLivre-Setup-0.5.0-win64.exe`.
 5. Distribua esse ficheiro e execute-o para instalar. A aplicação e os dados do agendador ficam em locais diferentes: a fila de downloads é preservada em `%LOCALAPPDATA%\MediaLivre` mesmo se a app for desinstalada.
-6. O instalador oferece a criação de um atalho no Ambiente de Trabalho e usa `medialivre.ico` no setup, no executável e no atalho.
+6. O instalador cria por padrão um atalho no Ambiente de Trabalho e usa `medialivre.ico` no setup, no executável e no atalho; pode desmarcar essa opção durante a instalação.
 
 FFmpeg e ffprobe ficam incluídos no bundle do instalador. O utilizador final não precisa de os instalar separadamente para combinar streams ou converter para MP3/MKV/AVI.
 

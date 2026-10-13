@@ -27,7 +27,7 @@ SetupLogging=yes
 Name: "portuguese"; MessagesFile: "compiler:Languages\Portuguese.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Criar um atalho no Ambiente de Trabalho"; GroupDescription: "Atalhos adicionais:"; Flags: unchecked
+Name: "desktopicon"; Description: "Criar um atalho no Ambiente de Trabalho"; GroupDescription: "Atalhos adicionais:"
 
 [Files]
 Source: "dist\MediaLivre\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
