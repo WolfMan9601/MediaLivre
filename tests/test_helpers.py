@@ -1,6 +1,7 @@
 import unittest
+from pathlib import Path
 
-from medialivre import container_options, is_http_url, quality_format
+from medialivre import DownloadWorker, container_options, is_http_url, progress_details, quality_format
 
 
 class UrlValidationTests(unittest.TestCase):
@@ -47,6 +48,58 @@ class FormatSelectionTests(unittest.TestCase):
         avi = container_options("AVI")
         self.assertEqual(avi["postprocessors"], [{"key": "FFmpegVideoConvertor", "preferedformat": "avi"}])
         self.assertIn("-c:a", avi["postprocessor_args"]["videoconvertor+ffmpeg_o"])
+
+
+class PlaylistProgressTests(unittest.TestCase):
+    def test_reports_item_percent_and_overall_playlist_percent(self):
+        overall, item, item_label, batch_label = progress_details({
+            "status": "downloading",
+            "downloaded_bytes": 50,
+            "total_bytes": 100,
+            "info_dict": {
+                "playlist_index": 3,
+                "n_entries": 10,
+                "playlist_title": "A minha lista",
+                "title": "Vídeo atual",
+            },
+        })
+        self.assertEqual((overall, item), (25, 50))
+        self.assertIn("3/10", item_label)
+        self.assertIn("Vídeo atual", item_label)
+        self.assertIn("A minha lista", batch_label)
+
+    def test_handles_unknown_playlist_total_and_finished_item(self):
+        overall, item, item_label, batch_label = progress_details({
+            "status": "finished",
+            "info_dict": {"playlist_index": 4, "n_entries": "N/A", "title": "Último vídeo"},
+        })
+        self.assertEqual((overall, item), (100, 100))
+        self.assertIn("Item 4", item_label)
+        self.assertIn("total por determinar", batch_label)
+
+    def test_worker_emits_updated_item_when_playlist_entry_changes(self):
+        worker = DownloadWorker("https://example.com/list", Path("."), "720p", False, True)
+        overall_events = []
+        item_events = []
+        worker.progress.connect(lambda percent, label: overall_events.append((percent, label)))
+        worker.item_progress.connect(lambda percent, label: item_events.append((percent, label)))
+        for index, title, downloaded in [(1, "Primeiro", 50), (2, "Segundo", 20)]:
+            worker._progress_hook({
+                "status": "downloading",
+                "downloaded_bytes": downloaded,
+                "total_bytes": 100,
+                "info_dict": {
+                    "playlist_index": index,
+                    "n_entries": 2,
+                    "playlist_title": "Demonstração",
+                    "id": str(index),
+                    "title": title,
+                },
+            })
+        self.assertEqual([event[0] for event in overall_events], [25, 60])
+        self.assertEqual([event[0] for event in item_events], [50, 20])
+        self.assertIn("Primeiro", item_events[0][1])
+        self.assertIn("Segundo", item_events[1][1])
 
 
 if __name__ == "__main__":

@@ -7,11 +7,11 @@ Aplicação desktop de código aberto para gerir transferências de vídeo e áu
 ## Funcionalidades do protótipo
 
 - Interface desktop Qt em português.
-- Transferência de uma ligação HTTP(S), por predefinição; opção explícita para permitir listas.
+- Transferência individual ou, com opção explícita, playlists e URLs de canais reconhecidas pelo yt-dlp.
 - Escolha de qualidade: melhor disponível, 1080p, 720p ou 480p.
 - Escolha do contêiner de vídeo: automático, MP4, MKV ou AVI.
 - Extração opcional de áudio MP3 (requer FFmpeg).
-- Pasta de destino, indicador de progresso, log e cancelamento.
+- Pasta de destino, progresso global e progresso separado do vídeo atual em playlists/canais, log e cancelamento.
 - Execução do trabalho numa thread separada para manter a interface responsiva.
 - Não tem contas, gestão de cookies, armazenamento de credenciais ou telemetria própria.
 
@@ -46,7 +46,18 @@ Instale FFmpeg separadamente e confirme que `ffmpeg.exe` está no `PATH` para á
 
 Na lista **Formato do vídeo**, MP4 restringe a seleção a streams compatíveis com MP4; MKV converte/remuxa para Matroska; AVI usa vídeo Xvid e áudio MP3, quando os encoders FFmpeg necessários estão disponíveis. MKV/AVI e MP3 precisam de FFmpeg. A conversão AVI reencoda vídeo e áudio, pode demorar mais e pode reduzir a qualidade; MKV/MP4 tentam preservar os streams quando possível.
 
-Para gerar uma pasta executável Windows a partir de uma máquina Windows, execute `build_windows.bat`. O artefacto será criado em `dist\MediaLivre\MediaLivre.exe`; FFmpeg continua a ser instalado separadamente. O script de build ainda não foi executado neste ambiente Linux.
+Para gerar o executável Windows a partir de uma máquina Windows, execute `build_windows.bat` na pasta do projeto. O script instala PyInstaller no ambiente virtual e cria a versão em pasta em `dist\MediaLivre\MediaLivre.exe`. FFmpeg continua a ser instalado separadamente. O script de build ainda não foi executado neste ambiente Linux.
+
+Para compilar manualmente no PowerShell, a partir da pasta do projeto:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt pyinstaller
+.\.venv\Scripts\pyinstaller.exe --noconfirm --clean --windowed --name MediaLivre --collect-all yt_dlp --collect-all PySide6 medialivre.py
+```
+
+O comando padrão acima cria `dist\MediaLivre\MediaLivre.exe` e uma pasta de dependências. Para experimentar um único ficheiro (arranque inicial mais lento e maior probabilidade de alertas heurísticos do antivírus), adicione `--onefile`; o resultado passa para `dist\MediaLivre.exe`. Teste o executável num Windows limpo e instale FFmpeg separadamente no `PATH` para conversões/combinação de streams.
 
 ### Linux/macOS
 
@@ -65,7 +76,8 @@ Instale FFmpeg através do gestor de pacotes do sistema. Em ambiente sem display
 1. Instale Python, as dependências do projeto e FFmpeg conforme acima.
 2. Inicie `python medialivre.py` (ou `run_windows.bat` no Windows).
 3. Cole uma ligação HTTP(S) a um vídeo que criou, possui ou tem autorização para transferir. Comece com **Melhor disponível** e **Automático**; depois teste MP4, MKV e AVI separadamente.
-4. Confira o progresso/log e o ficheiro na pasta escolhida. Teste também **Cancelar** e, se apropriado, a opção de lista de reprodução.
+4. Para uma playlist ou URL de canal compatível com yt-dlp, marque **Transferir playlists e canais completos** antes de iniciar. A interface mostra o progresso geral e, separadamente, o índice, o nome e o progresso do item atual. Uma playlist/canal pode conter muitos itens e ocupar muito espaço.
+5. Confira o log e os ficheiros na pasta escolhida. Teste também **Cancelar**. A extração depende do suporte atual do yt-dlp ao serviço; não use com conteúdos sem autorização.
 
 Também pode fazer um teste de integração isolado na sua própria máquina com um ficheiro de vídeo local seu: sirva-o apenas em `127.0.0.1` por HTTP e cole a URL local no MediaLivre. O teste exercita a transferência sem consultar um site externo. Um vídeo de teste pode ser gerado com FFmpeg:
 

@@ -29,7 +29,7 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 
 def is_http_url(value: str) -> bool:
@@ -74,8 +74,45 @@ def container_options(container: str) -> dict:
     return {}
 
 
+def progress_details(data: dict) -> tuple[int, int, str, str]:
+    """Return overall percent, current-item percent, item label and batch label."""
+    info = data.get("info_dict") or {}
+    status = data.get("status")
+    total_bytes = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+    downloaded = data.get("downloaded_bytes") or 0
+    item_percent = 100 if status == "finished" else (
+        int(downloaded * 100 / total_bytes) if total_bytes else 0
+    )
+    item_percent = max(0, min(100, item_percent))
+
+    def number(value):
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    index = number(info.get("playlist_index"))
+    count = number(info.get("n_entries")) or number(info.get("playlist_count"))
+    title = str(info.get("title") or "A preparar o item…")
+    playlist = str(info.get("playlist_title") or info.get("playlist") or "Lista")
+    if index and count and count > 0:
+        overall = int(((index - 1 + item_percent / 100) / count) * 100)
+        item_label = f"Item {index}/{count} · {title}"
+        batch_label = f"{playlist} · item {index} de {count}"
+    elif index:
+        overall = item_percent
+        item_label = f"Item {index} · {title}"
+        batch_label = f"{playlist} · item {index} (total por determinar)"
+    else:
+        overall = item_percent
+        item_label = title
+        batch_label = "Progresso geral"
+    return max(0, min(100, overall)), item_percent, item_label, batch_label
+
+
 class DownloadWorker(QObject):
     progress = Signal(int, str)
+    item_progress = Signal(int, str)
     log_line = Signal(str)
     completed = Signal(str)
     failed = Signal(str)
@@ -92,6 +129,7 @@ class DownloadWorker(QObject):
         self.container = container
         self.cancel_requested = threading.Event()
         self.last_percent = -1
+        self.last_item_key = None
 
     def cancel(self) -> None:
         self.cancel_requested.set()
@@ -101,18 +139,21 @@ class DownloadWorker(QObject):
             raise DownloadError("Transferência cancelada pelo utilizador.")
         status = data.get("status")
         if status == "downloading":
-            total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
-            current = data.get("downloaded_bytes") or 0
-            percent = int(current * 100 / total) if total else 0
-            percent = max(0, min(100, percent))
-            if percent != self.last_percent:
+            overall, percent, item_label, batch_label = progress_details(data)
+            info = data.get("info_dict") or {}
+            item_key = (info.get("playlist_index"), info.get("id"), info.get("title"))
+            if percent != self.last_percent or item_key != self.last_item_key:
                 self.last_percent = percent
+                self.last_item_key = item_key
                 speed = data.get("_speed_str", "")
                 eta = data.get("_eta_str", "")
                 detail = " · ".join(x for x in (speed, f"restam {eta}" if eta else "") if x)
-                self.progress.emit(percent, detail)
+                self.progress.emit(overall, " · ".join(x for x in (batch_label, detail) if x))
+                self.item_progress.emit(percent, item_label)
         elif status == "finished":
-            self.progress.emit(100, "A preparar o ficheiro…")
+            overall, percent, item_label, batch_label = progress_details(data)
+            self.progress.emit(overall, f"{batch_label} · a preparar o ficheiro…")
+            self.item_progress.emit(percent, item_label)
 
     @Slot()
     def run(self) -> None:
@@ -261,7 +302,7 @@ class MainWindow(QMainWindow):
         dest_row.addWidget(self.browse_button)
         card_layout.addLayout(dest_row)
 
-        self.playlist_check = QCheckBox("Permitir listas de reprodução (pode transferir muitos itens)")
+        self.playlist_check = QCheckBox("Transferir playlists e canais completos (pode incluir muitos vídeos)")
         self.playlist_check.setChecked(False)
         card_layout.addWidget(self.playlist_check)
         layout.addWidget(card)
@@ -293,6 +334,25 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
         layout.addWidget(self.progress)
+
+        item_row = QHBoxLayout()
+        item_heading = QLabel("ITEM ATUAL")
+        item_heading.setObjectName("fieldLabel")
+        self.item_label = QLabel("À espera de item")
+        self.item_label.setObjectName("itemLabel")
+        self.item_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.item_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.item_percent = QLabel("0%")
+        self.item_percent.setObjectName("percent")
+        item_row.addWidget(item_heading)
+        item_row.addWidget(self.item_label, 1)
+        item_row.addWidget(self.item_percent)
+        layout.addLayout(item_row)
+        self.item_progress_bar = QProgressBar()
+        self.item_progress_bar.setRange(0, 100)
+        self.item_progress_bar.setValue(0)
+        self.item_progress_bar.setTextVisible(False)
+        layout.addWidget(self.item_progress_bar)
 
         log_label = QLabel("ATIVIDADE")
         log_label.setObjectName("fieldLabel")
@@ -334,6 +394,7 @@ class MainWindow(QMainWindow):
             QTextEdit { background: #0b1016; border: 1px solid #293543; border-radius: 8px; padding: 10px; color: #aebdcb; font-family: Consolas, monospace; font-size: 11px; }
             QLabel#status { color: #aebdcb; }
             QLabel#percent { color: #70bdff; font-weight: 700; }
+            QLabel#itemLabel { color: #c2ceda; }
             QLabel#notice { color: #8697a8; font-size: 11px; }
         """)
 
@@ -361,6 +422,9 @@ class MainWindow(QMainWindow):
         self.log.clear()
         self.progress.setValue(0)
         self.percent_label.setText("0%")
+        self.item_progress_bar.setValue(0)
+        self.item_percent.setText("0%")
+        self.item_label.setText("A preparar o primeiro item…")
         self.status_label.setText("A iniciar…")
         self._set_busy(True)
 
@@ -376,6 +440,7 @@ class MainWindow(QMainWindow):
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self._on_progress)
+        self.worker.item_progress.connect(self._on_item_progress)
         self.worker.log_line.connect(self._append_log)
         self.worker.completed.connect(self._on_completed)
         self.worker.failed.connect(self._on_failed)
@@ -399,6 +464,12 @@ class MainWindow(QMainWindow):
         self.progress.setValue(percent)
         self.percent_label.setText(f"{percent}%")
         self.status_label.setText(detail or "A transferir…")
+
+    @Slot(int, str)
+    def _on_item_progress(self, percent: int, item_label: str) -> None:
+        self.item_progress_bar.setValue(percent)
+        self.item_percent.setText(f"{percent}%")
+        self.item_label.setText(item_label)
 
     @Slot(str)
     def _append_log(self, text: str) -> None:
