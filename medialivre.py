@@ -29,7 +29,7 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 
 def is_http_url(value: str) -> bool:
@@ -46,14 +46,32 @@ def is_http_url(value: str) -> bool:
         return False
 
 
-def quality_format(quality: str, audio_only: bool) -> str:
+def quality_format(quality: str, audio_only: bool, container: str = "Automático") -> str:
     if audio_only:
         return "bestaudio/best"
-    if quality == "Melhor disponível":
-        return "bestvideo+bestaudio/best"
-    heights = {"1080p": 1080, "720p": 720, "480p": 480}
-    height = heights.get(quality, 1080)
-    return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+    max_height = {"1080p": 1080, "720p": 720, "480p": 480}.get(quality)
+    height = f"[height<={max_height}]" if max_height else ""
+    if container == "MP4":
+        return f"bestvideo[ext=mp4]{height}+bestaudio[ext=m4a]/best[ext=mp4]{height}"
+    return f"bestvideo{height}+bestaudio/best{height}"
+
+
+def container_options(container: str) -> dict:
+    """Return yt-dlp/FFmpeg settings for the selected final video container."""
+    if container == "MKV":
+        return {
+            "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mkv"}],
+        }
+    if container == "AVI":
+        return {
+            "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "avi"}],
+            "postprocessor_args": {
+                "videoconvertor+ffmpeg_o": ["-c:a", "libmp3lame", "-b:a", "192k"],
+            },
+        }
+    if container == "MP4":
+        return {"merge_output_format": "mp4"}
+    return {}
 
 
 class DownloadWorker(QObject):
@@ -64,13 +82,14 @@ class DownloadWorker(QObject):
     cancelled = Signal()
 
     def __init__(self, url: str, destination: Path, quality: str,
-                 audio_only: bool, allow_playlist: bool) -> None:
+                 audio_only: bool, allow_playlist: bool, container: str = "Automático") -> None:
         super().__init__()
         self.url = url
         self.destination = destination
         self.quality = quality
         self.audio_only = audio_only
         self.allow_playlist = allow_playlist
+        self.container = container
         self.cancel_requested = threading.Event()
         self.last_percent = -1
 
@@ -100,7 +119,7 @@ class DownloadWorker(QObject):
         try:
             self.destination.mkdir(parents=True, exist_ok=True)
             options: dict = {
-                "format": quality_format(self.quality, self.audio_only),
+                "format": quality_format(self.quality, self.audio_only, self.container),
                 "outtmpl": str(self.destination / "%(title).180B [%(id)s].%(ext)s"),
                 "noplaylist": not self.allow_playlist,
                 "windowsfilenames": True,
@@ -122,6 +141,8 @@ class DownloadWorker(QObject):
                     "preferredcodec": "mp3",
                     "preferredquality": "192",
                 }]
+            else:
+                options.update(container_options(self.container))
             self.log_line.emit("A obter informações da fonte…")
             with YoutubeDL(options) as ydl:
                 ydl.download([self.url])
@@ -214,10 +235,19 @@ class MainWindow(QMainWindow):
         qbox.addWidget(self.quality)
         controls.addLayout(qbox, 1)
 
+        fbox = QVBoxLayout()
+        flabel = QLabel("FORMATO DO VÍDEO")
+        flabel.setObjectName("fieldLabel")
+        self.video_format = QComboBox()
+        self.video_format.addItems(["Automático", "MP4", "MKV", "AVI"])
+        fbox.addWidget(flabel)
+        fbox.addWidget(self.video_format)
+        controls.addLayout(fbox, 1)
+
         self.audio_only = QCheckBox("Extrair apenas áudio (MP3)")
         self.audio_only.toggled.connect(self._toggle_audio)
-        controls.addWidget(self.audio_only, 1, Qt.AlignmentFlag.AlignVCenter)
         card_layout.addLayout(controls)
+        card_layout.addWidget(self.audio_only)
 
         destination_label = QLabel("PASTA DE DESTINO")
         destination_label.setObjectName("fieldLabel")
@@ -310,6 +340,7 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _toggle_audio(self, enabled: bool) -> None:
         self.quality.setEnabled(not enabled)
+        self.video_format.setEnabled(not enabled)
 
     @Slot()
     def choose_destination(self) -> None:
@@ -340,6 +371,7 @@ class MainWindow(QMainWindow):
             quality=self.quality.currentText(),
             audio_only=self.audio_only.isChecked(),
             allow_playlist=self.playlist_check.isChecked(),
+            container=self.video_format.currentText(),
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -411,6 +443,7 @@ class MainWindow(QMainWindow):
         self.browse_button.setEnabled(not busy)
         self.url_input.setEnabled(not busy)
         self.quality.setEnabled(not busy and not self.audio_only.isChecked())
+        self.video_format.setEnabled(not busy and not self.audio_only.isChecked())
         self.audio_only.setEnabled(not busy)
         self.playlist_check.setEnabled(not busy)
 
