@@ -43,6 +43,8 @@ Se a política do PowerShell impedir a ativação, use diretamente:
 
 Instale FFmpeg separadamente e confirme que `ffmpeg.exe` está no `PATH` para áudio/combinação de streams.
 
+Para gerar uma pasta executável Windows a partir de uma máquina Windows, execute `build_windows.bat`. O artefacto será criado em `dist\MediaLivre\MediaLivre.exe`; FFmpeg continua a ser instalado separadamente. O script de build ainda não foi executado neste ambiente Linux.
+
 ### Linux/macOS
 
 ```bash
