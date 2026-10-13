@@ -38,4 +38,4 @@ echo A compilar o instalador com: %ISCC_EXE%
 if errorlevel 1 exit /b 1
 
 echo.
-echo Instalador criado em dist\installer\MediaLivre-Setup-0.6.0-win64.exe
+echo Instalador criado em dist\installer\MediaLivre-Setup-0.7.0-win64.exe

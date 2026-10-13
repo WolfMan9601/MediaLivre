@@ -57,7 +57,7 @@ class FormatSelectionTests(unittest.TestCase):
     def test_mp4_selects_compatible_streams(self):
         self.assertEqual(
             quality_format("720p", False, "MP4"),
-            "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]",
+            "bestvideo[vcodec^=avc1][ext=mp4][height<=720]+bestaudio[ext=m4a]/best[vcodec^=avc1][ext=mp4][height<=720]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]",
         )
 
     def test_best_available_and_audio_only(self):

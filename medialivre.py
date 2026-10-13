@@ -36,7 +36,7 @@ from yt_dlp.utils import DownloadError
 from download_scheduler import ScheduleStore, ScheduledDownload, default_database_path
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 
 
 def resource_path(*parts: str) -> Path:
@@ -110,7 +110,14 @@ def quality_format(quality: str, audio_only: bool, container: str = "Automático
     max_height = {"1080p": 1080, "720p": 720, "480p": 480}.get(quality)
     height = f"[height<={max_height}]" if max_height else ""
     if container == "MP4":
-        return f"bestvideo[ext=mp4]{height}+bestaudio[ext=m4a]/best[ext=mp4]{height}"
+        # Prefer H.264/AVC + AAC/M4A for broad Windows player compatibility.
+        # Fall back only to an MP4 that still contains video, never to audio-only.
+        return (
+            f"bestvideo[vcodec^=avc1][ext=mp4]{height}+bestaudio[ext=m4a]/"
+            f"best[vcodec^=avc1][ext=mp4]{height}/"
+            f"bestvideo[ext=mp4]{height}+bestaudio[ext=m4a]/"
+            f"best[ext=mp4]{height}"
+        )
     return f"bestvideo{height}+bestaudio/best{height}"
 
 
@@ -148,6 +155,14 @@ def media_processing_options(download_thumbnail: bool, audio_only: bool, contain
     else:
         video_options = container_options(container)
         postprocessors.extend(video_options.pop("postprocessors", []))
+        if container == "MP4":
+            postprocessors.append({"key": "FFmpegVideoConvertor", "preferedformat": "mp4"})
+            video_options["postprocessor_args"] = {
+                "videoconvertor+ffmpeg_o": [
+                    "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+                ],
+            }
         options.update(video_options)
     if download_thumbnail and (audio_only or container in {"MP4", "MKV"}):
         postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": True})
