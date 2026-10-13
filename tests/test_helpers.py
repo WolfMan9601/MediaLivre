@@ -6,6 +6,7 @@ from medialivre import (
     container_options,
     is_collection_url,
     is_http_url,
+    media_processing_options,
     playlist_enabled,
     progress_details,
     quality_format,
@@ -73,6 +74,23 @@ class FormatSelectionTests(unittest.TestCase):
         avi = container_options("AVI")
         self.assertEqual(avi["postprocessors"], [{"key": "FFmpegVideoConvertor", "preferedformat": "avi"}])
         self.assertIn("-c:a", avi["postprocessor_args"]["videoconvertor+ffmpeg_o"])
+
+    def test_thumbnail_download_and_embed_options(self):
+        audio = media_processing_options(True, True, "MP4")
+        self.assertTrue(audio["writethumbnail"])
+        self.assertEqual(
+            [pp["key"] for pp in audio["postprocessors"]],
+            ["FFmpegThumbnailsConvertor", "FFmpegExtractAudio", "EmbedThumbnail"],
+        )
+        avi = media_processing_options(True, False, "AVI")
+        self.assertEqual(
+            [pp["key"] for pp in avi["postprocessors"]],
+            ["FFmpegThumbnailsConvertor", "FFmpegVideoConvertor"],
+        )
+        automatic = media_processing_options(True, False, "Automático")
+        self.assertEqual([pp["key"] for pp in automatic["postprocessors"]], ["FFmpegThumbnailsConvertor"])
+        disabled = media_processing_options(False, False, "MP4")
+        self.assertNotIn("writethumbnail", disabled)
 
 
 class PlaylistProgressTests(unittest.TestCase):

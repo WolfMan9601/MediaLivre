@@ -12,6 +12,7 @@ Aplicação desktop de código aberto para gerir transferências de vídeo e áu
 - Escolha de qualidade: melhor disponível, 1080p, 720p ou 480p.
 - Escolha do contêiner de vídeo: automático, MP4, MKV ou AVI.
 - Extração opcional de áudio MP3 e conversões usando FFmpeg/ffprobe preparados automaticamente no build Windows.
+- Download da miniatura/capa em JPG, ativado por padrão, com incorporação em MP3, MP4 e MKV quando suportado.
 - Pasta de destino, progresso global e progresso separado do vídeo atual em playlists/canais, log e cancelamento.
 - Agendamentos únicos persistidos em SQLite, com estado, opções e cancelamento de tarefas pendentes.
 - Execução do trabalho numa thread separada para manter a interface responsiva.
@@ -56,7 +57,7 @@ Ao executar pelo `run_windows.bat`, o script `prepare_ffmpeg_windows.bat` descar
 
 Na lista **Formato do vídeo**, MP4 restringe a seleção a streams compatíveis com MP4; MKV converte/remuxa para Matroska; AVI usa vídeo Xvid e áudio MP3, quando os encoders FFmpeg necessários estão disponíveis. MKV/AVI e MP3 precisam de FFmpeg. A conversão AVI reencoda vídeo e áudio, pode demorar mais e pode reduzir a qualidade; MKV/MP4 tentam preservar os streams quando possível.
 
-Para gerar o instalador Windows, instale apenas o Python 3.10+ de 64 bits e execute `create_installer_windows.bat`. Se o Inno Setup não estiver instalado, o script baixa automaticamente o compilador oficial mais recente para `%LOCALAPPDATA%\MediaLivre\tools\InnoSetup`, sem exigir `Activate.ps1` nem instalação manual. Em seguida prepara FFmpeg/ffprobe, compila com PyInstaller e usa `installer_windows.iss`; o instalador final ficará em `dist\installer\MediaLivre-Setup-0.5.0-win64.exe`. O setup inclui o runtime Python, PySide6, yt-dlp, FFmpeg, ffprobe e o ícone, e cria o atalho do Ambiente de Trabalho por predefinição. Este build Windows não foi executado nem verificado neste ambiente Linux. Consulte [`INSTALAR_WINDOWS.md`](INSTALAR_WINDOWS.md).
+Para gerar o instalador Windows, instale apenas o Python 3.10+ de 64 bits e execute `create_installer_windows.bat`. Se o Inno Setup não estiver instalado, o script baixa automaticamente o compilador oficial mais recente para `%LOCALAPPDATA%\MediaLivre\tools\InnoSetup`, sem exigir `Activate.ps1` nem instalação manual. Em seguida prepara FFmpeg/ffprobe, compila com PyInstaller e usa `installer_windows.iss`; o instalador final ficará em `dist\installer\MediaLivre-Setup-0.6.0-win64.exe`. O setup inclui o runtime Python, PySide6, yt-dlp, mutagen, FFmpeg, ffprobe e o ícone, e cria o atalho do Ambiente de Trabalho por predefinição. Este build Windows não foi executado nem verificado neste ambiente Linux. Consulte [`INSTALAR_WINDOWS.md`](INSTALAR_WINDOWS.md).
 
 Se apenas precisar de compilar a aplicação, execute `build_windows.bat`; cria `dist\MediaLivre\MediaLivre.exe` com os ficheiros de runtime e a pasta `ffmpeg` adjacentes.
 
@@ -66,7 +67,7 @@ Para compilar manualmente no PowerShell, a partir da pasta do projeto:
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt pyinstaller
-.\.venv\Scripts\pyinstaller.exe --noconfirm --clean --windowed --name MediaLivre --collect-all yt_dlp --collect-all PySide6 --hidden-import download_scheduler medialivre.py
+.\.venv\Scripts\pyinstaller.exe --noconfirm --clean --windowed --name MediaLivre --icon assets\medialivre.ico --add-data "assets;assets" --collect-all yt_dlp --collect-all PySide6 --hidden-import download_scheduler --hidden-import mutagen medialivre.py
 ```
 
 O comando padrão acima cria `dist\MediaLivre\MediaLivre.exe` e uma pasta de dependências. Para experimentar um único ficheiro (arranque inicial mais lento e maior probabilidade de alertas heurísticos do antivírus), adicione `--onefile`; o resultado passa para `dist\MediaLivre.exe`. Teste o executável num Windows limpo e instale FFmpeg separadamente no `PATH` para conversões/combinação de streams.
@@ -87,7 +88,7 @@ Instale FFmpeg através do gestor de pacotes do sistema. Em ambiente sem display
 
 1. Instale Python, as dependências do projeto e FFmpeg conforme acima.
 2. Inicie `python medialivre.py` (ou `run_windows.bat` no Windows).
-3. Cole uma ligação HTTP(S) a um vídeo que criou, possui ou tem autorização para transferir. Comece com **Melhor disponível** e **Automático**; depois teste MP4, MKV e AVI separadamente.
+3. Cole uma ligação HTTP(S) a um vídeo que criou, possui ou tem autorização para transferir. Comece com **Melhor disponível** e **Automático**; depois teste MP4, MKV e AVI separadamente. A opção **Baixar miniatura/capa em JPG e incorporar quando possível** vem marcada: será criado um JPG junto da mídia e a capa será embutida no MP3/MP4/MKV quando o contêiner permitir.
 4. Para uma playlist ou URL de canal compatível com yt-dlp, a caixa **Transferir playlists e canais completos automaticamente** já vem marcada. O programa deteta URLs com `list=`, `/playlist`, `/channel/`, `/@`, `/c/` e `/user/`, força `noplaylist=False` e solicita os itens `1-`, em vez de limitar ao primeiro vídeo. Desmarque-a apenas quando quiser baixar um vídeo individual de uma URL que também contenha uma playlist.
 5. Confira o log e os ficheiros na pasta escolhida. Teste também **Cancelar**. A extração depende do suporte atual do yt-dlp ao serviço; não use com conteúdos sem autorização.
 

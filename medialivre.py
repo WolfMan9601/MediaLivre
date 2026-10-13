@@ -36,7 +36,7 @@ from yt_dlp.utils import DownloadError
 from download_scheduler import ScheduleStore, ScheduledDownload, default_database_path
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 
 def resource_path(*parts: str) -> Path:
@@ -132,6 +132,30 @@ def container_options(container: str) -> dict:
     return {}
 
 
+def media_processing_options(download_thumbnail: bool, audio_only: bool, container: str) -> dict:
+    """Build yt-dlp post-processors for thumbnails, audio extraction and containers."""
+    options: dict = {}
+    postprocessors = []
+    if download_thumbnail:
+        options["writethumbnail"] = True
+        postprocessors.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg"})
+    if audio_only:
+        postprocessors.append({
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        })
+    else:
+        video_options = container_options(container)
+        postprocessors.extend(video_options.pop("postprocessors", []))
+        options.update(video_options)
+    if download_thumbnail and (audio_only or container in {"MP4", "MKV"}):
+        postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": True})
+    if postprocessors:
+        options["postprocessors"] = postprocessors
+    return options
+
+
 def progress_details(data: dict) -> tuple[int, int, str, str]:
     """Return overall percent, current-item percent, item label and batch label."""
     info = data.get("info_dict") or {}
@@ -177,7 +201,8 @@ class DownloadWorker(QObject):
     cancelled = Signal()
 
     def __init__(self, url: str, destination: Path, quality: str,
-                 audio_only: bool, allow_playlist: bool, container: str = "Automático") -> None:
+                 audio_only: bool, allow_playlist: bool, container: str = "Automático",
+                 download_thumbnail: bool = True) -> None:
         super().__init__()
         self.url = url
         self.destination = destination
@@ -185,6 +210,7 @@ class DownloadWorker(QObject):
         self.audio_only = audio_only
         self.allow_playlist = allow_playlist
         self.container = container
+        self.download_thumbnail = download_thumbnail
         self.cancel_requested = threading.Event()
         self.last_percent = -1
         self.last_item_key = None
@@ -244,14 +270,9 @@ class DownloadWorker(QObject):
                 options["ffmpeg_location"] = str(location)
             elif self.container != "Automático" or self.audio_only:
                 self.log_line.emit("Aviso: FFmpeg/ffprobe não encontrado; conversão de formato pode falhar.")
-            if self.audio_only:
-                options["postprocessors"] = [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }]
-            else:
-                options.update(container_options(self.container))
+            options.update(media_processing_options(self.download_thumbnail, self.audio_only, self.container))
+            output_format = "MP3" if self.audio_only else (self.container or "Automático")
+            self.log_line.emit(f"Formato selecionado: {output_format}. Miniatura/capa: {'sim' if self.download_thumbnail else 'não'}.")
             self.log_line.emit("A obter informações da fonte…")
             with YoutubeDL(options) as ydl:
                 ydl.download([self.url])
@@ -370,8 +391,14 @@ class MainWindow(QMainWindow):
 
         self.audio_only = QCheckBox("Extrair apenas áudio (MP3)")
         self.audio_only.toggled.connect(self._toggle_audio)
+        self.thumbnail_check = QCheckBox("Baixar miniatura/capa em JPG e incorporar quando possível")
+        self.thumbnail_check.setChecked(True)
+        self.thumbnail_check.setToolTip(
+            "Guarda a imagem do vídeo como JPG e incorpora a capa em MP3, MP4 ou MKV quando o formato suportar."
+        )
         card_layout.addLayout(controls)
         card_layout.addWidget(self.audio_only)
+        card_layout.addWidget(self.thumbnail_check)
 
         destination_label = QLabel("PASTA DE DESTINO")
         destination_label.setObjectName("fieldLabel")
@@ -510,6 +537,7 @@ class MainWindow(QMainWindow):
             "quality": self.quality.currentText(),
             "container": self.video_format.currentText(),
             "audio_only": self.audio_only.isChecked(),
+            "download_thumbnail": self.thumbnail_check.isChecked(),
             "allow_playlist": self.playlist_check.isChecked(),
             "destination": str(self.destination),
         }
@@ -653,6 +681,7 @@ class MainWindow(QMainWindow):
             self.quality.setCurrentText(str(options.get("quality", "Melhor disponível")))
             self.video_format.setCurrentText(str(options.get("container", "Automático")))
             self.audio_only.setChecked(bool(options.get("audio_only", False)))
+            self.thumbnail_check.setChecked(bool(options.get("download_thumbnail", True)))
             self.playlist_check.setChecked(bool(options.get("allow_playlist", False)))
             self.destination = Path(options.get("destination") or self.destination)
             self.destination_text.setText(str(self.destination))
@@ -687,6 +716,7 @@ class MainWindow(QMainWindow):
             audio_only=self.audio_only.isChecked(),
             allow_playlist=self.playlist_check.isChecked(),
             container=self.video_format.currentText(),
+            download_thumbnail=self.thumbnail_check.isChecked(),
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -770,6 +800,7 @@ class MainWindow(QMainWindow):
         self.quality.setEnabled(not busy and not self.audio_only.isChecked())
         self.video_format.setEnabled(not busy and not self.audio_only.isChecked())
         self.audio_only.setEnabled(not busy)
+        self.thumbnail_check.setEnabled(not busy)
         self.playlist_check.setEnabled(not busy)
 
     @Slot()
