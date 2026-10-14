@@ -1,27 +1,26 @@
 import unittest
 import io
 import json
+import hashlib
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
 from medialivre import (
     DownloadWorker,
+    InstallerDownloadWorker,
     SkipCurrentItem,
     UpdateCheckWorker,
-    browser_cookie_options,
     collection_items,
-    collection_label,
     container_options,
-    is_instagram_stories_url,
+    extract_sha256,
     is_collection_url,
-    is_instagram_url,
     is_http_url,
     media_processing_options,
     playlist_enabled,
     progress_details,
     quality_format,
     version_tuple,
-    user_facing_download_error,
 )
 
 
@@ -71,52 +70,6 @@ class UrlValidationTests(unittest.TestCase):
         self.assertFalse(is_collection_url("https://www.instagram.com/reel/ABC123/"))
         self.assertFalse(is_collection_url("https://www.instagram.com/p/ABC123/"))
 
-    def test_detects_instagram_story_collections_and_single_stories(self):
-        story_urls = [
-            "https://www.instagram.com/stories/artist/",
-            "https://instagram.com/stories/artist?hl=pt",
-            "https://www.instagram.com/stories/highlights/18090946048123978/",
-        ]
-        for url in story_urls:
-            with self.subTest(url=url):
-                self.assertTrue(is_instagram_stories_url(url))
-                self.assertTrue(is_collection_url(url))
-                self.assertTrue(playlist_enabled(url, True))
-                self.assertEqual(collection_label(url), "Stories do Instagram")
-        single_story = "https://www.instagram.com/stories/artist/3570766765028588805/"
-        self.assertFalse(is_instagram_stories_url(single_story))
-        self.assertFalse(is_collection_url(single_story))
-        self.assertFalse(playlist_enabled(single_story, True))
-
-    def test_browser_cookies_are_only_enabled_for_instagram(self):
-        story_url = "https://www.instagram.com/stories/artist/3570766765028588805/"
-        self.assertTrue(is_instagram_url(story_url))
-        self.assertEqual(
-            browser_cookie_options(story_url, "chrome"),
-            {"cookiesfrombrowser": ("chrome", None, None, None)},
-        )
-        self.assertEqual(browser_cookie_options("https://youtube.com/watch?v=1", "chrome"), {})
-        with self.assertRaises(ValueError):
-            browser_cookie_options(story_url, "unknown")
-
-    def test_instagram_login_error_explains_local_browser_session(self):
-        message = user_facing_download_error(
-            "ERROR: You need to log in to access this content. Use --cookies-from-browser",
-            "https://www.instagram.com/stories/artist/123/",
-        )
-        self.assertIn("sessão autenticada", message)
-        self.assertIn("sessão local do navegador", message)
-        self.assertIn("não guarda a sua palavra-passe nem os cookies", message)
-
-    def test_instagram_cookie_database_error_explains_chrome_lock(self):
-        message = user_facing_download_error(
-            "ERROR: Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271",
-            "https://www.instagram.com/stories/artist/123/",
-        )
-        self.assertIn("Feche completamente o Chrome", message)
-        self.assertIn("Gestor de Tarefas", message)
-        self.assertIn("Edge/Firefox/Vivaldi", message)
-
     def test_normalizes_flat_collection_entries(self):
         items = collection_items({
             "entries": [
@@ -131,6 +84,8 @@ class UrlValidationTests(unittest.TestCase):
 
 class UpdateCheckTests(unittest.TestCase):
     def test_detects_new_release_and_installer_asset(self):
+        payload_bytes = b"installer bytes"
+        checksum = hashlib.sha256(payload_bytes).hexdigest()
         payload = [{
             "tag_name": "v0.9.0",
             "name": "MediaLivre 0.9.0",
@@ -138,6 +93,9 @@ class UpdateCheckTests(unittest.TestCase):
             "assets": [{
                 "name": "MediaLivre-Setup-0.9.0-win64.exe",
                 "browser_download_url": "https://github.com/WolfMan9601/MediaLivre/releases/download/v0.9.0/MediaLivre-Setup-0.9.0-win64.exe",
+            }, {
+                "name": "MediaLivre-Setup-0.9.0-win64.exe.sha256",
+                "browser_download_url": "https://github.com/WolfMan9601/MediaLivre/releases/download/v0.9.0/MediaLivre-Setup-0.9.0-win64.exe.sha256",
             }],
         }]
         events = []
@@ -147,6 +105,49 @@ class UpdateCheckTests(unittest.TestCase):
             worker.run()
         self.assertEqual(events[0][0]["version"], "v0.9.0")
         self.assertTrue(events[0][0]["installer_url"].endswith("MediaLivre-Setup-0.9.0-win64.exe"))
+        self.assertTrue(events[0][0]["checksum_url"].endswith(".exe.sha256"))
+
+    def test_extracts_sha256_digest(self):
+        digest = "a" * 64
+        self.assertEqual(extract_sha256(f"{digest}  MediaLivre-Setup.exe"), digest)
+        self.assertIsNone(extract_sha256("checksum ausente"))
+
+    def test_download_worker_validates_checksum_before_completion(self):
+        payload_bytes = b"installer bytes"
+        checksum = hashlib.sha256(payload_bytes).hexdigest()
+
+        class FakeResponse(io.BytesIO):
+            def __init__(self, data, headers=None):
+                super().__init__(data)
+                self.headers = headers or {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "MediaLivre-Setup-test.exe"
+            events = []
+            worker = InstallerDownloadWorker(
+                "https://example.test/MediaLivre-Setup-test.exe",
+                "https://example.test/MediaLivre-Setup-test.exe.sha256",
+                target,
+            )
+            worker.completed.connect(lambda path: events.append(("completed", path)))
+            worker.failed.connect(lambda message: events.append(("failed", message)))
+            with patch(
+                "medialivre.urlopen",
+                side_effect=[
+                    FakeResponse(payload_bytes, {"Content-Length": str(len(payload_bytes))}),
+                    FakeResponse(f"{checksum}  MediaLivre-Setup-test.exe".encode()),
+                ],
+            ):
+                worker.run()
+            self.assertEqual(events[0][0], "completed")
+            self.assertEqual(Path(events[0][1]).read_bytes(), payload_bytes)
+            self.assertFalse(target.with_name(f".{target.name}.part").exists())
 
 
 class FormatSelectionTests(unittest.TestCase):
@@ -195,21 +196,6 @@ class FormatSelectionTests(unittest.TestCase):
         self.assertNotIn("postprocessors", automatic)
         disabled = media_processing_options(False, False, "MP4")
         self.assertNotIn("writethumbnail", disabled)
-
-    def test_worker_adds_browser_cookies_for_instagram_story(self):
-        worker = DownloadWorker(
-            "https://www.instagram.com/stories/artist/123/",
-            Path("."),
-            "Melhor disponível",
-            False,
-            False,
-            cookies_browser="edge",
-        )
-        self.assertEqual(
-            worker._download_options()["cookiesfrombrowser"],
-            ("edge", None, None, None),
-        )
-
 
 class PlaylistProgressTests(unittest.TestCase):
     def test_reports_item_percent_and_overall_playlist_percent(self):

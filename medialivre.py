@@ -3,14 +3,16 @@ from __future__ import annotations
 import os
 import json
 import re
+import hashlib
 import sqlite3
 import sys
+import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QUrl, QDateTime, QTimer, QLockFile, QSettings
+from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QUrl, QDateTime, QTimer, QLockFile, QSettings, QProcess
 from PySide6.QtGui import QDesktopServices, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,6 +25,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QCheckBox,
     QDateTimeEdit,
@@ -41,7 +44,7 @@ from download_scheduler import ScheduleStore, ScheduledDownload, default_databas
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.11.1"
+APP_VERSION = "0.12.0"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 
@@ -65,98 +68,8 @@ def is_http_url(value: str) -> bool:
         return False
 
 
-COOKIE_BROWSER_CHOICES = (
-    ("Chrome", "chrome"),
-    ("Edge", "edge"),
-    ("Firefox", "firefox"),
-    ("Brave", "brave"),
-    ("Vivaldi", "vivaldi"),
-)
-COOKIE_BROWSER_NAMES = {value for _label, value in COOKIE_BROWSER_CHOICES}
-
-
-def is_instagram_url(value: str) -> bool:
-    """Return whether a user-supplied URL belongs to Instagram."""
-    try:
-        parsed = urlparse(value.strip())
-        host = (parsed.hostname or "").lower().removeprefix("www.")
-        return parsed.scheme.lower() in {"http", "https"} and host == "instagram.com"
-    except ValueError:
-        return False
-
-
-def browser_cookie_options(url: str, browser: str | None) -> dict:
-    """Read browser cookies only for Instagram URLs; never persist the cookie data."""
-    browser_name = (browser or "").strip().lower()
-    if not browser_name or not is_instagram_url(url):
-        return {}
-    if browser_name not in COOKIE_BROWSER_NAMES:
-        raise ValueError(f"Navegador não suportado para cookies: {browser_name}")
-    return {"cookiesfrombrowser": (browser_name, None, None, None)}
-
-
-def user_facing_download_error(message: str, url: str) -> str:
-    """Explain Instagram session failures without exposing credentials or raw internals only."""
-    clean = message.strip() or "erro desconhecido"
-    lowered = clean.lower()
-    if not is_instagram_url(url):
-        return clean
-    if "could not find" in lowered and "cookies" in lowered:
-        return (
-            "Não foi possível encontrar a base de cookies do navegador escolhido. "
-            "Confirme que o navegador está instalado e que existe uma sessão do Instagram."
-        )
-    if "could not copy" in lowered and "cookie database" in lowered:
-        return (
-            "O Chrome mantém a base de cookies bloqueada. Feche completamente o Chrome, "
-            "incluindo processos em segundo plano no Gestor de Tarefas, e tente novamente. "
-            "Também pode desativar «Continuar a executar aplicações em segundo plano» nas "
-            "definições do Chrome ou escolher Edge/Firefox/Vivaldi. O MediaLivre não consegue "
-            "ler a base enquanto o navegador a mantém bloqueada."
-        )
-    if "could not decrypt" in lowered or "decrypt" in lowered and "cookie" in lowered:
-        return (
-            "Não foi possível ler os cookies protegidos desse navegador. "
-            "Escolha outro navegador ou feche-o antes de tentar novamente."
-        )
-    if (
-        "you need to log in" in lowered
-        or "login required" in lowered
-        or "login to access" in lowered
-        or "requires authentication" in lowered
-    ):
-        return (
-            "O Instagram exige uma sessão autenticada para este Story. "
-            "Ative «Usar sessão local do navegador para Instagram», escolha o navegador "
-            "onde está autenticado e tente novamente. O MediaLivre lê os cookies apenas "
-            "localmente e não guarda a sua palavra-passe nem os cookies."
-        )
-    return clean
-
-
-def is_instagram_stories_url(value: str) -> bool:
-    """Detect Instagram profile Stories and Highlights collections.
-
-    A URL ending with a numeric story id remains an individual item so it can be
-    downloaded directly without opening the collection picker.
-    """
-    try:
-        parsed = urlparse(value.strip())
-        host = (parsed.hostname or "").lower().removeprefix("www.")
-        parts = [part for part in parsed.path.lower().split("/") if part]
-        if parsed.scheme.lower() not in {"http", "https"} or host != "instagram.com":
-            return False
-        if len(parts) == 2 and parts[0] == "stories" and parts[1] != "highlights":
-            return True
-        return len(parts) == 3 and parts[0] == "stories" and parts[1] == "highlights"
-    except ValueError:
-        return False
-
-
 def collection_label(value: str) -> str:
     """Return a user-facing name for the collection represented by a URL."""
-    if is_instagram_stories_url(value):
-        return "Stories do Instagram"
     try:
         parsed = urlparse(value.strip())
         host = (parsed.hostname or "").lower()
@@ -169,7 +82,7 @@ def collection_label(value: str) -> str:
 
 
 def is_collection_url(value: str) -> bool:
-    """Detect playlist/channel/profile/Stories URLs so collections are not reduced to one item."""
+    """Detect playlist/channel/profile URLs so collections are not reduced to one item."""
     try:
         parsed = urlparse(value.strip())
         host = (parsed.hostname or "").lower()
@@ -190,8 +103,6 @@ def is_collection_url(value: str) -> bool:
             return path.startswith("/@") and "/video/" not in path
         if "instagram.com" in host:
             parts = [part for part in path.split("/") if part]
-            if is_instagram_stories_url(value):
-                return True
             return len(parts) == 1 and parts[0] not in {"reel", "reels", "p", "tv"}
         return False
     except ValueError:
@@ -239,6 +150,12 @@ def version_tuple(value: str) -> tuple[int, ...]:
     return tuple(int(part or 0) for part in match.groups())
 
 
+def extract_sha256(text: str) -> str | None:
+    """Extract the first standard SHA-256 digest from a checksum asset."""
+    match = re.search(r"\b([0-9a-fA-F]{64})\b", text or "")
+    return match.group(1).lower() if match else None
+
+
 class UpdateCheckWorker(QObject):
     releases = Signal(object)
     failed = Signal(str)
@@ -270,16 +187,24 @@ class UpdateCheckWorker(QObject):
                 if not version or not release_url:
                     continue
                 installer_url = ""
+                checksum_url = ""
+                installer_name = ""
                 for asset in release.get("assets") or []:
                     name = str(asset.get("name") or "").lower()
                     if name.startswith("medialivre-setup-") and name.endswith(".exe"):
                         installer_url = str(asset.get("browser_download_url") or "")
+                        installer_name = name
+                for asset in release.get("assets") or []:
+                    name = str(asset.get("name") or "").lower()
+                    if installer_name and name == f"{installer_name}.sha256":
+                        checksum_url = str(asset.get("browser_download_url") or "")
                         break
                 normalized.append({
                     "version": version,
                     "name": str(release.get("name") or version),
                     "release_url": release_url,
                     "installer_url": installer_url,
+                    "checksum_url": checksum_url,
                     "prerelease": bool(release.get("prerelease")),
                     "published_at": str(release.get("published_at") or ""),
                 })
@@ -290,6 +215,82 @@ class UpdateCheckWorker(QObject):
             self.releases.emit(normalized)
         except Exception as exc:
             self.failed.emit(str(exc).strip() or exc.__class__.__name__)
+
+
+class InstallerDownloadWorker(QObject):
+    progress = Signal(int)
+    status = Signal(str)
+    completed = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, installer_url: str, checksum_url: str, target_path: Path) -> None:
+        super().__init__()
+        self.installer_url = installer_url
+        self.checksum_url = checksum_url
+        self.target_path = target_path
+        self.cancel_requested = threading.Event()
+
+    def cancel(self) -> None:
+        self.cancel_requested.set()
+
+    @Slot()
+    def run(self) -> None:
+        partial_path = self.target_path.with_name(f".{self.target_path.name}.part")
+        try:
+            self.target_path.parent.mkdir(parents=True, exist_ok=True)
+            partial_path.unlink(missing_ok=True)
+            request = Request(
+                self.installer_url,
+                headers={"Accept": "application/octet-stream", "User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+            )
+            self.status.emit("A descarregar o instalador…")
+            digest = hashlib.sha256()
+            with urlopen(request, timeout=30) as response, partial_path.open("wb") as output:
+                try:
+                    total = int(response.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    total = 0
+                downloaded = 0
+                while True:
+                    if self.cancel_requested.is_set():
+                        partial_path.unlink(missing_ok=True)
+                        self.cancelled.emit()
+                        return
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    digest.update(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        self.progress.emit(max(0, min(100, int(downloaded * 100 / total))))
+            if self.cancel_requested.is_set():
+                partial_path.unlink(missing_ok=True)
+                self.cancelled.emit()
+                return
+            if self.checksum_url:
+                self.status.emit("A validar a assinatura SHA-256…")
+                checksum_request = Request(
+                    self.checksum_url,
+                    headers={"Accept": "text/plain", "User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+                )
+                with urlopen(checksum_request, timeout=15) as response:
+                    expected = extract_sha256(response.read().decode("utf-8", errors="replace"))
+                if not expected:
+                    raise ValueError("O ficheiro de checksum não contém um SHA-256 válido.")
+                if digest.hexdigest().lower() != expected:
+                    raise ValueError("A validação SHA-256 do instalador falhou; o ficheiro não será executado.")
+            self.target_path.unlink(missing_ok=True)
+            partial_path.replace(self.target_path)
+            self.progress.emit(100)
+            self.completed.emit(str(self.target_path))
+        except Exception as exc:
+            partial_path.unlink(missing_ok=True)
+            if self.cancel_requested.is_set():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(exc).strip() or exc.__class__.__name__)
 
 
 def ffmpeg_location() -> Path | None:
@@ -421,10 +422,9 @@ class CollectionInspectWorker(QObject):
     found = Signal(object, str)
     failed = Signal(str)
 
-    def __init__(self, url: str, cookies_browser: str | None = None) -> None:
+    def __init__(self, url: str) -> None:
         super().__init__()
         self.url = url
-        self.cookies_browser = cookies_browser
 
     @Slot()
     def run(self) -> None:
@@ -438,7 +438,6 @@ class CollectionInspectWorker(QObject):
                 "no_warnings": False,
                 "socket_timeout": 20,
             }
-            options.update(browser_cookie_options(self.url, self.cookies_browser))
             with YoutubeDL(options) as ydl:
                 info = ydl.extract_info(self.url, download=False)
             items = collection_items(info or {})
@@ -516,7 +515,7 @@ class ReleaseSelectionDialog(QDialog):
         layout = QVBoxLayout(self)
         heading = QLabel(
             f"Versão instalada: {current_version}\n"
-            "Escolha uma Release para abrir o instalador oficial ou consultar as notas."
+            "Escolha uma Release. A app descarrega, valida e inicia automaticamente o instalador oficial."
         )
         heading.setWordWrap(True)
         layout.addWidget(heading)
@@ -534,17 +533,22 @@ class ReleaseSelectionDialog(QDialog):
         self.detail.setWordWrap(True)
         layout.addWidget(self.detail)
         self.release_combo.currentIndexChanged.connect(self._update_detail)
-        self._update_detail(0)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        self.open_button = buttons.addButton("Abrir instalador/página", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.open_button = buttons.addButton("Atualizar automaticamente", QDialogButtonBox.ButtonRole.AcceptRole)
         self.open_button.clicked.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._update_detail(0)
 
     def _update_detail(self, index: int) -> None:
         release = self.release_combo.itemData(index) or {}
-        target = "instalador EXE disponível" if release.get("installer_url") else "página da Release"
-        self.detail.setText(f"{release.get('name', release.get('version', ''))}\nAbrirá: {target}.")
+        if release.get("installer_url"):
+            target = "descarregará e validará o instalador automaticamente"
+            self.open_button.setText("Atualizar automaticamente")
+        else:
+            target = "abrirá a página da Release (sem instalador EXE)"
+            self.open_button.setText("Abrir página da Release")
+        self.detail.setText(f"{release.get('name', release.get('version', ''))}\nAção: {target}.")
 
     def selected_release(self) -> dict | None:
         return self.release_combo.currentData()
@@ -565,8 +569,7 @@ class DownloadWorker(QObject):
 
     def __init__(self, url: str, destination: Path, quality: str,
                  audio_only: bool, allow_playlist: bool, container: str = "Automático",
-                 download_thumbnail: bool = True, selected_items: list[dict] | None = None,
-                 cookies_browser: str | None = None) -> None:
+                 download_thumbnail: bool = True, selected_items: list[dict] | None = None) -> None:
         super().__init__()
         self.url = url
         self.destination = destination
@@ -576,7 +579,6 @@ class DownloadWorker(QObject):
         self.container = container
         self.download_thumbnail = download_thumbnail
         self.selected_items = selected_items
-        self.cookies_browser = cookies_browser
         self.cancel_requested = threading.Event()
         self.skip_requested = threading.Event()
         self.last_percent = -1
@@ -650,7 +652,6 @@ class DownloadWorker(QObject):
             "quiet": True,
             "socket_timeout": 20,
         }
-        inspect_options.update(browser_cookie_options(self.url, self.cookies_browser))
         with YoutubeDL(inspect_options) as ydl:
             info = ydl.extract_info(self.url, download=False)
         items = collection_items(info or {})
@@ -677,11 +678,6 @@ class DownloadWorker(QObject):
             "retries": 3,
             "fragment_retries": 3,
         }
-        options.update(browser_cookie_options(self.url, self.cookies_browser))
-        if self.cookies_browser and is_instagram_url(self.url):
-            self.log_line.emit(
-                f"A usar a sessão local do navegador {self.cookies_browser.title()} para o Instagram."
-            )
         location = ffmpeg_location()
         if location:
             options["ffmpeg_location"] = str(location)
@@ -734,7 +730,7 @@ class DownloadWorker(QObject):
                         if self.cancel_requested.is_set():
                             self.cancelled.emit()
                             return
-                        message = user_facing_download_error(str(exc), item["url"])
+                        message = str(exc).strip() or exc.__class__.__name__
                         failures.append(f"{item['title']}: {message}")
                         self.log_line.emit(f"Erro no item {position}/{self.total_items}: {message}")
                         if self.total_items == 1:
@@ -752,7 +748,7 @@ class DownloadWorker(QObject):
             if self.cancel_requested.is_set():
                 self.cancelled.emit()
             else:
-                message = user_facing_download_error(str(exc), self.url) or exc.__class__.__name__
+                message = str(exc).strip() or exc.__class__.__name__
                 self.failed.emit(message)
 
     # yt-dlp logger protocol
@@ -768,7 +764,7 @@ class DownloadWorker(QObject):
         self.log_line.emit(f"Aviso: {message}")
 
     def error(self, message: str) -> None:
-        self.log_line.emit(f"Erro: {user_facing_download_error(message, self.url)}")
+        self.log_line.emit(f"Erro: {message}")
 
 
 class MainWindow(QMainWindow):
@@ -783,6 +779,9 @@ class MainWindow(QMainWindow):
         self.selection_worker: CollectionInspectWorker | None = None
         self.update_thread: QThread | None = None
         self.update_worker: UpdateCheckWorker | None = None
+        self.install_update_thread: QThread | None = None
+        self.install_update_worker: InstallerDownloadWorker | None = None
+        self.install_update_progress: QProgressDialog | None = None
         self.available_releases: list[dict] = []
         self._manual_update_check = False
         self._selection_start_after = False
@@ -820,7 +819,7 @@ class MainWindow(QMainWindow):
         brand = QVBoxLayout()
         title = QLabel("MediaLivre")
         title.setObjectName("title")
-        subtitle = QLabel("Transferências de YouTube, TikTok, Instagram Stories e outras fontes suportadas.")
+        subtitle = QLabel("Transferências de YouTube, TikTok, Instagram e outras fontes suportadas.")
         subtitle.setObjectName("subtitle")
         brand.addWidget(title)
         brand.addWidget(subtitle)
@@ -894,35 +893,19 @@ class MainWindow(QMainWindow):
         dest_row.addWidget(self.browse_button)
         card_layout.addLayout(dest_row)
 
-        self.playlist_check = QCheckBox("Transferir playlists, canais e Stories completos")
+        self.playlist_check = QCheckBox("Transferir playlists e canais completos")
         self.playlist_check.setChecked(True)
         self.playlist_check.setToolTip(
-            "Ao iniciar uma playlist, canal ou Stories do Instagram, poderá escolher exatamente quais itens baixar."
+            "Ao iniciar uma playlist, canal ou perfil suportado, poderá escolher exatamente quais itens baixar."
         )
         playlist_row = QHBoxLayout()
         playlist_row.addWidget(self.playlist_check, 1)
         self.choose_items_button = QPushButton("Escolher itens")
-        self.choose_items_button.setToolTip("Ler a playlist, canal ou Stories e selecionar itens específicos.")
+        self.choose_items_button.setToolTip("Ler a playlist, canal ou perfil e selecionar itens específicos.")
         self.choose_items_button.clicked.connect(self._choose_collection_items)
         playlist_row.addWidget(self.choose_items_button)
         card_layout.addLayout(playlist_row)
 
-        browser_row = QHBoxLayout()
-        self.instagram_session_check = QCheckBox("Usar sessão local do navegador para Instagram")
-        self.instagram_session_check.setToolTip(
-            "Lê temporariamente os cookies do navegador escolhido para Stories que exigem login. "
-            "Não guarda cookies nem palavras-passe."
-        )
-        self.instagram_session_check.toggled.connect(self._toggle_browser_session)
-        browser_row.addWidget(self.instagram_session_check, 1)
-        browser_row.addWidget(QLabel("Navegador:"))
-        self.instagram_browser = QComboBox()
-        for label, value in COOKIE_BROWSER_CHOICES:
-            self.instagram_browser.addItem(label, value)
-        self.instagram_browser.setEnabled(False)
-        self.instagram_browser.setToolTip("Escolha o navegador onde a sessão do Instagram está iniciada.")
-        browser_row.addWidget(self.instagram_browser)
-        card_layout.addLayout(browser_row)
         layout.addWidget(card)
 
         schedule_card = QFrame()
@@ -1026,7 +1009,7 @@ class MainWindow(QMainWindow):
 
         notice = QLabel(
             "Use apenas com conteúdos que tem direito ou autorização para transferir. "
-            "O MediaLivre não contorna DRM, autenticação ou controlos de acesso. Stories do Instagram que exigem sessão podem usar cookies locais do navegador escolhido; eles não são guardados nem enviados pelo app."
+            "O MediaLivre não contorna DRM, autenticação ou controlos de acesso."
         )
         notice.setObjectName("notice")
         notice.setWordWrap(True)
@@ -1041,7 +1024,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Não é uma coleção",
-                "Esta ligação parece ser um item individual, como um vídeo ou Story. Pode iniciar o download diretamente.",
+                "Esta ligação parece ser um item individual, como um vídeo. Pode iniciar o download diretamente.",
             )
             return
         self._begin_collection_selection(url, start_after=False)
@@ -1055,7 +1038,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("A ler a coleção…")
         self._set_busy(True)
         self.selection_thread = QThread(self)
-        self.selection_worker = CollectionInspectWorker(url, self._selected_cookie_browser(url))
+        self.selection_worker = CollectionInspectWorker(url)
         self.selection_worker.moveToThread(self.selection_thread)
         self.selection_thread.started.connect(self.selection_worker.run)
         self.selection_worker.found.connect(self._on_collection_found)
@@ -1092,10 +1075,8 @@ class MainWindow(QMainWindow):
         self._selection_start_after = False
         self._set_busy(False)
         self.status_label.setText("Não foi possível ler a coleção")
-        url = self.url_input.text().strip()
-        friendly = user_facing_download_error(message, url)
-        self._append_log(f"Erro ao ler a coleção: {friendly}")
-        QMessageBox.warning(self, "Coleção indisponível", friendly)
+        self._append_log(f"Erro ao ler a coleção: {message}")
+        QMessageBox.warning(self, "Coleção indisponível", message)
 
     @Slot()
     def _selection_thread_finished(self) -> None:
@@ -1168,9 +1149,114 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         release = dialog.selected_release() or {}
-        target_url = release.get("installer_url") or release.get("release_url")
-        if target_url:
-            QDesktopServices.openUrl(QUrl(str(target_url)))
+        installer_url = str(release.get("installer_url") or "")
+        if installer_url:
+            self._start_installer_download(release)
+        elif release.get("release_url"):
+            QDesktopServices.openUrl(QUrl(str(release["release_url"])))
+
+    def _start_installer_download(self, release: dict) -> None:
+        if self.install_update_thread and self.install_update_thread.isRunning():
+            return
+        if self.thread and self.thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Transferência em curso",
+                "Conclua ou cancele a transferência atual antes de atualizar o MediaLivre.",
+            )
+            return
+        installer_url = str(release.get("installer_url") or "")
+        if not installer_url:
+            return
+        installer_name = Path(urlparse(installer_url).path).name
+        if not installer_name.lower().endswith(".exe"):
+            release_version = str(release.get("version") or "0.0.0").lstrip("vV")
+            installer_name = f"MediaLivre-Setup-{release_version}.exe"
+        target_path = Path(tempfile.gettempdir()) / installer_name
+        self.install_update_progress = QProgressDialog(
+            "A preparar a atualização…",
+            "Cancelar",
+            0,
+            100,
+            self,
+        )
+        self.install_update_progress.setWindowTitle("Atualização do MediaLivre")
+        self.install_update_progress.setAutoClose(False)
+        self.install_update_progress.setAutoReset(False)
+        self.install_update_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self.install_update_progress.show()
+        self.update_button.setEnabled(False)
+        self.update_button.setText("A atualizar…")
+        self.install_update_thread = QThread(self)
+        self.install_update_worker = InstallerDownloadWorker(
+            installer_url,
+            str(release.get("checksum_url") or ""),
+            target_path,
+        )
+        self.install_update_worker.moveToThread(self.install_update_thread)
+        self.install_update_thread.started.connect(self.install_update_worker.run)
+        self.install_update_worker.progress.connect(self.install_update_progress.setValue)
+        self.install_update_worker.status.connect(self.install_update_progress.setLabelText)
+        self.install_update_worker.completed.connect(self._on_installer_downloaded)
+        self.install_update_worker.failed.connect(self._on_installer_download_failed)
+        self.install_update_worker.cancelled.connect(self._on_installer_download_cancelled)
+        self.install_update_worker.completed.connect(self.install_update_thread.quit)
+        self.install_update_worker.failed.connect(self.install_update_thread.quit)
+        self.install_update_worker.cancelled.connect(self.install_update_thread.quit)
+        self.install_update_thread.finished.connect(self._install_update_thread_finished)
+        self.install_update_progress.canceled.connect(self.install_update_worker.cancel)
+        self.install_update_thread.start()
+
+    @Slot(str)
+    def _on_installer_downloaded(self, path: str) -> None:
+        if self.install_update_progress:
+            self.install_update_progress.setLabelText("A iniciar o instalador; o MediaLivre será fechado…")
+            self.install_update_progress.setCancelButton(None)
+            self.install_update_progress.setValue(100)
+        started = QProcess.startDetached(
+            path,
+            ["/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
+        )
+        if not started:
+            if self.install_update_progress:
+                self.install_update_progress.close()
+            QMessageBox.warning(
+                self,
+                "Atualização não iniciada",
+                "O instalador foi descarregado, mas o Windows não conseguiu iniciá-lo automaticamente. "
+                f"Pode executá-lo manualmente em:\n{path}",
+            )
+            return
+        QTimer.singleShot(400, QApplication.instance().quit)
+
+    @Slot(str)
+    def _on_installer_download_failed(self, message: str) -> None:
+        if self.install_update_progress:
+            self.install_update_progress.close()
+        QMessageBox.warning(
+            self,
+            "Atualização não concluída",
+            f"Não foi possível descarregar ou validar o instalador.\n\n{message}",
+        )
+
+    @Slot()
+    def _on_installer_download_cancelled(self) -> None:
+        if self.install_update_progress:
+            self.install_update_progress.close()
+
+    @Slot()
+    def _install_update_thread_finished(self) -> None:
+        if self.install_update_worker:
+            self.install_update_worker.deleteLater()
+        if self.install_update_thread:
+            self.install_update_thread.deleteLater()
+        self.install_update_worker = None
+        self.install_update_thread = None
+        if self.install_update_progress:
+            self.install_update_progress.deleteLater()
+        self.install_update_progress = None
+        self.update_button.setEnabled(True)
+        self.update_button.setText("Atualizações")
 
     @Slot(str)
     def _update_check_failed(self, message: str) -> None:
@@ -1192,7 +1278,8 @@ class MainWindow(QMainWindow):
         self.update_worker = None
         self.update_thread = None
         self._manual_update_check = False
-        self.update_button.setEnabled(True)
+        if not (self.install_update_thread and self.install_update_thread.isRunning()):
+            self.update_button.setEnabled(True)
 
     def _schedule_current_download(self) -> None:
         url = self.url_input.text().strip()
@@ -1211,7 +1298,6 @@ class MainWindow(QMainWindow):
             "audio_only": self.audio_only.isChecked(),
             "download_thumbnail": self.thumbnail_check.isChecked(),
             "allow_playlist": self.playlist_check.isChecked(),
-            "cookies_browser": self._selected_cookie_browser(url),
             "destination": str(self.destination),
         }
         try:
@@ -1344,10 +1430,6 @@ class MainWindow(QMainWindow):
         else:
             self.thumbnail_check.setChecked(False)
 
-    @Slot(bool)
-    def _toggle_browser_session(self, enabled: bool) -> None:
-        self.instagram_browser.setEnabled(enabled and not bool(self.thread and self.thread.isRunning()))
-
     @Slot()
     def choose_destination(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Escolher pasta", str(self.destination))
@@ -1369,10 +1451,6 @@ class MainWindow(QMainWindow):
             self.audio_only.setChecked(bool(options.get("audio_only", False)))
             self.thumbnail_check.setChecked(bool(options.get("download_thumbnail", True)))
             self.playlist_check.setChecked(bool(options.get("allow_playlist", True)))
-            browser = str(options.get("cookies_browser") or "")
-            self.instagram_session_check.setChecked(browser in COOKIE_BROWSER_NAMES)
-            if browser in COOKIE_BROWSER_NAMES:
-                self.instagram_browser.setCurrentIndex(max(0, self.instagram_browser.findData(browser)))
             self.destination = Path(options.get("destination") or self.destination)
             self.destination_text.setText(str(self.destination))
         self._active_schedule_id = scheduled_job.id if scheduled_job else None
@@ -1416,7 +1494,6 @@ class MainWindow(QMainWindow):
             container=self.video_format.currentText(),
             download_thumbnail=self.thumbnail_check.isChecked(),
             selected_items=selected_items,
-            cookies_browser=self._selected_cookie_browser(url),
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -1487,8 +1564,6 @@ class MainWindow(QMainWindow):
     def _on_failed(self, message: str) -> None:
         self.status_label.setText("A transferência não foi concluída")
         self._append_log(message)
-        if message.startswith("O Instagram exige") or message.startswith("Não foi possível ler os cookies"):
-            QMessageBox.warning(self, "Sessão do Instagram necessária", message)
         self._finish_active_schedule("failed", message)
         self._set_busy(False)
 
@@ -1523,13 +1598,6 @@ class MainWindow(QMainWindow):
         self.audio_only.setEnabled(not busy)
         self.thumbnail_check.setEnabled(not busy and self.audio_only.isChecked())
         self.playlist_check.setEnabled(not busy)
-        self.instagram_session_check.setEnabled(not busy)
-        self.instagram_browser.setEnabled(not busy and self.instagram_session_check.isChecked())
-
-    def _selected_cookie_browser(self, url: str) -> str | None:
-        if not self.instagram_session_check.isChecked() or not is_instagram_url(url):
-            return None
-        return str(self.instagram_browser.currentData() or "") or None
 
     @Slot()
     def open_destination(self) -> None:
