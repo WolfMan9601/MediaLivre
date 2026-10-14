@@ -8,17 +8,20 @@ from medialivre import (
     DownloadWorker,
     SkipCurrentItem,
     UpdateCheckWorker,
+    browser_cookie_options,
     collection_items,
     collection_label,
     container_options,
     is_instagram_stories_url,
     is_collection_url,
+    is_instagram_url,
     is_http_url,
     media_processing_options,
     playlist_enabled,
     progress_details,
     quality_format,
     version_tuple,
+    user_facing_download_error,
 )
 
 
@@ -84,6 +87,26 @@ class UrlValidationTests(unittest.TestCase):
         self.assertFalse(is_instagram_stories_url(single_story))
         self.assertFalse(is_collection_url(single_story))
         self.assertFalse(playlist_enabled(single_story, True))
+
+    def test_browser_cookies_are_only_enabled_for_instagram(self):
+        story_url = "https://www.instagram.com/stories/artist/3570766765028588805/"
+        self.assertTrue(is_instagram_url(story_url))
+        self.assertEqual(
+            browser_cookie_options(story_url, "chrome"),
+            {"cookiesfrombrowser": ("chrome", None, None, None)},
+        )
+        self.assertEqual(browser_cookie_options("https://youtube.com/watch?v=1", "chrome"), {})
+        with self.assertRaises(ValueError):
+            browser_cookie_options(story_url, "unknown")
+
+    def test_instagram_login_error_explains_local_browser_session(self):
+        message = user_facing_download_error(
+            "ERROR: You need to log in to access this content. Use --cookies-from-browser",
+            "https://www.instagram.com/stories/artist/123/",
+        )
+        self.assertIn("sessão autenticada", message)
+        self.assertIn("sessão local do navegador", message)
+        self.assertIn("não guarda a sua palavra-passe nem os cookies", message)
 
     def test_normalizes_flat_collection_entries(self):
         items = collection_items({
@@ -163,6 +186,20 @@ class FormatSelectionTests(unittest.TestCase):
         self.assertNotIn("postprocessors", automatic)
         disabled = media_processing_options(False, False, "MP4")
         self.assertNotIn("writethumbnail", disabled)
+
+    def test_worker_adds_browser_cookies_for_instagram_story(self):
+        worker = DownloadWorker(
+            "https://www.instagram.com/stories/artist/123/",
+            Path("."),
+            "Melhor disponível",
+            False,
+            False,
+            cookies_browser="edge",
+        )
+        self.assertEqual(
+            worker._download_options()["cookiesfrombrowser"],
+            ("edge", None, None, None),
+        )
 
 
 class PlaylistProgressTests(unittest.TestCase):

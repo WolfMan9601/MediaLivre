@@ -41,7 +41,7 @@ from download_scheduler import ScheduleStore, ScheduledDownload, default_databas
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.11.0"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 
@@ -63,6 +63,67 @@ def is_http_url(value: str) -> bool:
         )
     except ValueError:
         return False
+
+
+COOKIE_BROWSER_CHOICES = (
+    ("Chrome", "chrome"),
+    ("Edge", "edge"),
+    ("Firefox", "firefox"),
+    ("Brave", "brave"),
+    ("Vivaldi", "vivaldi"),
+)
+COOKIE_BROWSER_NAMES = {value for _label, value in COOKIE_BROWSER_CHOICES}
+
+
+def is_instagram_url(value: str) -> bool:
+    """Return whether a user-supplied URL belongs to Instagram."""
+    try:
+        parsed = urlparse(value.strip())
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        return parsed.scheme.lower() in {"http", "https"} and host == "instagram.com"
+    except ValueError:
+        return False
+
+
+def browser_cookie_options(url: str, browser: str | None) -> dict:
+    """Read browser cookies only for Instagram URLs; never persist the cookie data."""
+    browser_name = (browser or "").strip().lower()
+    if not browser_name or not is_instagram_url(url):
+        return {}
+    if browser_name not in COOKIE_BROWSER_NAMES:
+        raise ValueError(f"Navegador não suportado para cookies: {browser_name}")
+    return {"cookiesfrombrowser": (browser_name, None, None, None)}
+
+
+def user_facing_download_error(message: str, url: str) -> str:
+    """Explain Instagram session failures without exposing credentials or raw internals only."""
+    clean = message.strip() or "erro desconhecido"
+    lowered = clean.lower()
+    if not is_instagram_url(url):
+        return clean
+    if "could not find" in lowered and "cookies" in lowered:
+        return (
+            "Não foi possível encontrar a base de cookies do navegador escolhido. "
+            "Confirme que o navegador está instalado e que existe uma sessão do Instagram."
+        )
+    if "could not decrypt" in lowered or "decrypt" in lowered and "cookie" in lowered:
+        return (
+            "Não foi possível ler os cookies protegidos desse navegador. "
+            "Escolha outro navegador ou feche-o antes de tentar novamente."
+        )
+    if (
+        "you need to log in" in lowered
+        or "login required" in lowered
+        or "login to access" in lowered
+        or "requires authentication" in lowered
+    ):
+        return (
+            "O Instagram exige uma sessão autenticada para este Story. "
+            "Ative «Usar sessão local do navegador para Instagram», escolha o navegador "
+            "onde está autenticado e tente novamente. O MediaLivre lê os cookies apenas "
+            "localmente e não guarda a sua palavra-passe nem os cookies."
+        )
+    return clean
 
 
 def is_instagram_stories_url(value: str) -> bool:
@@ -352,9 +413,10 @@ class CollectionInspectWorker(QObject):
     found = Signal(object, str)
     failed = Signal(str)
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, cookies_browser: str | None = None) -> None:
         super().__init__()
         self.url = url
+        self.cookies_browser = cookies_browser
 
     @Slot()
     def run(self) -> None:
@@ -368,6 +430,7 @@ class CollectionInspectWorker(QObject):
                 "no_warnings": False,
                 "socket_timeout": 20,
             }
+            options.update(browser_cookie_options(self.url, self.cookies_browser))
             with YoutubeDL(options) as ydl:
                 info = ydl.extract_info(self.url, download=False)
             items = collection_items(info or {})
@@ -494,7 +557,8 @@ class DownloadWorker(QObject):
 
     def __init__(self, url: str, destination: Path, quality: str,
                  audio_only: bool, allow_playlist: bool, container: str = "Automático",
-                 download_thumbnail: bool = True, selected_items: list[dict] | None = None) -> None:
+                 download_thumbnail: bool = True, selected_items: list[dict] | None = None,
+                 cookies_browser: str | None = None) -> None:
         super().__init__()
         self.url = url
         self.destination = destination
@@ -504,6 +568,7 @@ class DownloadWorker(QObject):
         self.container = container
         self.download_thumbnail = download_thumbnail
         self.selected_items = selected_items
+        self.cookies_browser = cookies_browser
         self.cancel_requested = threading.Event()
         self.skip_requested = threading.Event()
         self.last_percent = -1
@@ -577,6 +642,7 @@ class DownloadWorker(QObject):
             "quiet": True,
             "socket_timeout": 20,
         }
+        inspect_options.update(browser_cookie_options(self.url, self.cookies_browser))
         with YoutubeDL(inspect_options) as ydl:
             info = ydl.extract_info(self.url, download=False)
         items = collection_items(info or {})
@@ -603,6 +669,11 @@ class DownloadWorker(QObject):
             "retries": 3,
             "fragment_retries": 3,
         }
+        options.update(browser_cookie_options(self.url, self.cookies_browser))
+        if self.cookies_browser and is_instagram_url(self.url):
+            self.log_line.emit(
+                f"A usar a sessão local do navegador {self.cookies_browser.title()} para o Instagram."
+            )
         location = ffmpeg_location()
         if location:
             options["ffmpeg_location"] = str(location)
@@ -655,7 +726,7 @@ class DownloadWorker(QObject):
                         if self.cancel_requested.is_set():
                             self.cancelled.emit()
                             return
-                        message = str(exc).strip() or "erro desconhecido"
+                        message = user_facing_download_error(str(exc), item["url"])
                         failures.append(f"{item['title']}: {message}")
                         self.log_line.emit(f"Erro no item {position}/{self.total_items}: {message}")
                         if self.total_items == 1:
@@ -673,7 +744,7 @@ class DownloadWorker(QObject):
             if self.cancel_requested.is_set():
                 self.cancelled.emit()
             else:
-                message = str(exc).strip() or exc.__class__.__name__
+                message = user_facing_download_error(str(exc), self.url) or exc.__class__.__name__
                 self.failed.emit(message)
 
     # yt-dlp logger protocol
@@ -827,6 +898,23 @@ class MainWindow(QMainWindow):
         self.choose_items_button.clicked.connect(self._choose_collection_items)
         playlist_row.addWidget(self.choose_items_button)
         card_layout.addLayout(playlist_row)
+
+        browser_row = QHBoxLayout()
+        self.instagram_session_check = QCheckBox("Usar sessão local do navegador para Instagram")
+        self.instagram_session_check.setToolTip(
+            "Lê temporariamente os cookies do navegador escolhido para Stories que exigem login. "
+            "Não guarda cookies nem palavras-passe."
+        )
+        self.instagram_session_check.toggled.connect(self._toggle_browser_session)
+        browser_row.addWidget(self.instagram_session_check, 1)
+        browser_row.addWidget(QLabel("Navegador:"))
+        self.instagram_browser = QComboBox()
+        for label, value in COOKIE_BROWSER_CHOICES:
+            self.instagram_browser.addItem(label, value)
+        self.instagram_browser.setEnabled(False)
+        self.instagram_browser.setToolTip("Escolha o navegador onde a sessão do Instagram está iniciada.")
+        browser_row.addWidget(self.instagram_browser)
+        card_layout.addLayout(browser_row)
         layout.addWidget(card)
 
         schedule_card = QFrame()
@@ -930,7 +1018,7 @@ class MainWindow(QMainWindow):
 
         notice = QLabel(
             "Use apenas com conteúdos que tem direito ou autorização para transferir. "
-            "O MediaLivre não contorna DRM, autenticação ou controlos de acesso. Stories privados do Instagram podem exigir sessão/cookies; esta versão não os guarda."
+            "O MediaLivre não contorna DRM, autenticação ou controlos de acesso. Stories do Instagram que exigem sessão podem usar cookies locais do navegador escolhido; eles não são guardados nem enviados pelo app."
         )
         notice.setObjectName("notice")
         notice.setWordWrap(True)
@@ -959,7 +1047,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("A ler a coleção…")
         self._set_busy(True)
         self.selection_thread = QThread(self)
-        self.selection_worker = CollectionInspectWorker(url)
+        self.selection_worker = CollectionInspectWorker(url, self._selected_cookie_browser(url))
         self.selection_worker.moveToThread(self.selection_thread)
         self.selection_thread.started.connect(self.selection_worker.run)
         self.selection_worker.found.connect(self._on_collection_found)
@@ -996,8 +1084,10 @@ class MainWindow(QMainWindow):
         self._selection_start_after = False
         self._set_busy(False)
         self.status_label.setText("Não foi possível ler a coleção")
-        self._append_log(f"Erro ao ler a coleção: {message}")
-        QMessageBox.warning(self, "Coleção indisponível", message)
+        url = self.url_input.text().strip()
+        friendly = user_facing_download_error(message, url)
+        self._append_log(f"Erro ao ler a coleção: {friendly}")
+        QMessageBox.warning(self, "Coleção indisponível", friendly)
 
     @Slot()
     def _selection_thread_finished(self) -> None:
@@ -1113,6 +1203,7 @@ class MainWindow(QMainWindow):
             "audio_only": self.audio_only.isChecked(),
             "download_thumbnail": self.thumbnail_check.isChecked(),
             "allow_playlist": self.playlist_check.isChecked(),
+            "cookies_browser": self._selected_cookie_browser(url),
             "destination": str(self.destination),
         }
         try:
@@ -1245,6 +1336,10 @@ class MainWindow(QMainWindow):
         else:
             self.thumbnail_check.setChecked(False)
 
+    @Slot(bool)
+    def _toggle_browser_session(self, enabled: bool) -> None:
+        self.instagram_browser.setEnabled(enabled and not bool(self.thread and self.thread.isRunning()))
+
     @Slot()
     def choose_destination(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Escolher pasta", str(self.destination))
@@ -1266,6 +1361,10 @@ class MainWindow(QMainWindow):
             self.audio_only.setChecked(bool(options.get("audio_only", False)))
             self.thumbnail_check.setChecked(bool(options.get("download_thumbnail", True)))
             self.playlist_check.setChecked(bool(options.get("allow_playlist", True)))
+            browser = str(options.get("cookies_browser") or "")
+            self.instagram_session_check.setChecked(browser in COOKIE_BROWSER_NAMES)
+            if browser in COOKIE_BROWSER_NAMES:
+                self.instagram_browser.setCurrentIndex(max(0, self.instagram_browser.findData(browser)))
             self.destination = Path(options.get("destination") or self.destination)
             self.destination_text.setText(str(self.destination))
         self._active_schedule_id = scheduled_job.id if scheduled_job else None
@@ -1309,6 +1408,7 @@ class MainWindow(QMainWindow):
             container=self.video_format.currentText(),
             download_thumbnail=self.thumbnail_check.isChecked(),
             selected_items=selected_items,
+            cookies_browser=self._selected_cookie_browser(url),
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -1379,6 +1479,8 @@ class MainWindow(QMainWindow):
     def _on_failed(self, message: str) -> None:
         self.status_label.setText("A transferência não foi concluída")
         self._append_log(message)
+        if message.startswith("O Instagram exige") or message.startswith("Não foi possível ler os cookies"):
+            QMessageBox.warning(self, "Sessão do Instagram necessária", message)
         self._finish_active_schedule("failed", message)
         self._set_busy(False)
 
@@ -1413,6 +1515,13 @@ class MainWindow(QMainWindow):
         self.audio_only.setEnabled(not busy)
         self.thumbnail_check.setEnabled(not busy and self.audio_only.isChecked())
         self.playlist_check.setEnabled(not busy)
+        self.instagram_session_check.setEnabled(not busy)
+        self.instagram_browser.setEnabled(not busy and self.instagram_session_check.isChecked())
+
+    def _selected_cookie_browser(self, url: str) -> str | None:
+        if not self.instagram_session_check.isChecked() or not is_instagram_url(url):
+            return None
+        return str(self.instagram_browser.currentData() or "") or None
 
     @Slot()
     def open_destination(self) -> None:

@@ -1,5 +1,5 @@
 #define AppName "MediaLivre"
-#define AppVersion "0.10.0"
+#define AppVersion "0.11.0"
 #define AppPublisher "MediaLivre contributors"
 #define AppExeName "MediaLivre.exe"
 
