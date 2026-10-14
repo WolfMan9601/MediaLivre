@@ -41,7 +41,7 @@ from download_scheduler import ScheduleStore, ScheduledDownload, default_databas
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 
@@ -135,7 +135,7 @@ def version_tuple(value: str) -> tuple[int, ...]:
 
 
 class UpdateCheckWorker(QObject):
-    available = Signal(str, str, str)
+    releases = Signal(object)
     failed = Signal(str)
 
     def __init__(self, repository: str, current_version: str) -> None:
@@ -146,7 +146,7 @@ class UpdateCheckWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            endpoint = f"https://api.github.com/repos/{self.repository}/releases/latest"
+            endpoint = f"https://api.github.com/repos/{self.repository}/releases?per_page=50"
             request = Request(
                 endpoint,
                 headers={
@@ -155,18 +155,34 @@ class UpdateCheckWorker(QObject):
                 },
             )
             with urlopen(request, timeout=10) as response:
-                release = json.load(response)
-            latest = str(release.get("tag_name") or "").strip()
-            release_url = str(release.get("html_url") or "").strip()
-            if not latest or not release_url or version_tuple(latest) <= version_tuple(self.current_version):
-                return
-            installer_url = ""
-            for asset in release.get("assets") or []:
-                name = str(asset.get("name") or "").lower()
-                if name.startswith("medialivre-setup-") and name.endswith(".exe"):
-                    installer_url = str(asset.get("browser_download_url") or "")
-                    break
-            self.available.emit(latest, release_url, installer_url)
+                payload = json.load(response)
+            normalized = []
+            for release in payload if isinstance(payload, list) else []:
+                if release.get("draft"):
+                    continue
+                version = str(release.get("tag_name") or "").strip()
+                release_url = str(release.get("html_url") or "").strip()
+                if not version or not release_url:
+                    continue
+                installer_url = ""
+                for asset in release.get("assets") or []:
+                    name = str(asset.get("name") or "").lower()
+                    if name.startswith("medialivre-setup-") and name.endswith(".exe"):
+                        installer_url = str(asset.get("browser_download_url") or "")
+                        break
+                normalized.append({
+                    "version": version,
+                    "name": str(release.get("name") or version),
+                    "release_url": release_url,
+                    "installer_url": installer_url,
+                    "prerelease": bool(release.get("prerelease")),
+                    "published_at": str(release.get("published_at") or ""),
+                })
+            normalized.sort(
+                key=lambda item: (version_tuple(item["version"]), item["published_at"]),
+                reverse=True,
+            )
+            self.releases.emit(normalized)
         except Exception as exc:
             self.failed.emit(str(exc).strip() or exc.__class__.__name__)
 
@@ -227,10 +243,11 @@ def container_options(container: str) -> dict:
 
 
 def media_processing_options(download_thumbnail: bool, audio_only: bool, container: str) -> dict:
-    """Build yt-dlp post-processors for thumbnails, audio extraction and containers."""
+    """Embed cover art in MP3; video downloads intentionally produce only the video file."""
     options: dict = {}
     postprocessors = []
-    if download_thumbnail:
+    embed_audio_cover = bool(download_thumbnail and audio_only)
+    if embed_audio_cover:
         options["writethumbnail"] = True
         postprocessors.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg"})
     if audio_only:
@@ -251,8 +268,9 @@ def media_processing_options(download_thumbnail: bool, audio_only: bool, contain
                 ],
             }
         options.update(video_options)
-    if download_thumbnail and (audio_only or container in {"MP4", "MKV"}):
-        postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": True})
+    if embed_audio_cover:
+        # False tells yt-dlp to remove the temporary JPG after embedding it in MP3.
+        postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
     if postprocessors:
         options["postprocessors"] = postprocessors
     return options
@@ -380,6 +398,49 @@ class CollectionSelectionDialog(QDialog):
             if row.checkState() == Qt.CheckState.Checked:
                 selected.append(row.data(Qt.ItemDataRole.UserRole))
         return selected
+
+
+class ReleaseSelectionDialog(QDialog):
+    def __init__(self, releases: list[dict], current_version: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Atualizações do MediaLivre")
+        self.setMinimumWidth(560)
+        self.releases = releases
+        layout = QVBoxLayout(self)
+        heading = QLabel(
+            f"Versão instalada: {current_version}\n"
+            "Escolha uma Release para abrir o instalador oficial ou consultar as notas."
+        )
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+        self.release_combo = QComboBox()
+        for release in releases:
+            suffix = " (pré-lançamento)" if release.get("prerelease") else ""
+            current = " (atual)" if version_tuple(release["version"]) == version_tuple(current_version) else ""
+            asset = " · instalador EXE" if release.get("installer_url") else " · sem instalador EXE"
+            self.release_combo.addItem(
+                f"{release['version']}{suffix}{current}{asset}",
+                release,
+            )
+        layout.addWidget(self.release_combo)
+        self.detail = QLabel()
+        self.detail.setWordWrap(True)
+        layout.addWidget(self.detail)
+        self.release_combo.currentIndexChanged.connect(self._update_detail)
+        self._update_detail(0)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        self.open_button = buttons.addButton("Abrir instalador/página", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.open_button.clicked.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _update_detail(self, index: int) -> None:
+        release = self.release_combo.itemData(index) or {}
+        target = "instalador EXE disponível" if release.get("installer_url") else "página da Release"
+        self.detail.setText(f"{release.get('name', release.get('version', ''))}\nAbrirá: {target}.")
+
+    def selected_release(self) -> dict | None:
+        return self.release_combo.currentData()
 
 
 class SkipCurrentItem(Exception):
@@ -529,7 +590,8 @@ class DownloadWorker(QObject):
                     f"Playlist/canal: {self.total_items} item(ns) selecionado(s) para transferência."
                 )
             output_format = "MP3" if self.audio_only else (self.container or "Automático")
-            self.log_line.emit(f"Formato selecionado: {output_format}. Miniatura/capa: {'sim' if self.download_thumbnail else 'não'}.")
+            cover_status = "incorporada no MP3" if self.audio_only and self.download_thumbnail else "não (vídeo sem JPG separado)"
+            self.log_line.emit(f"Formato selecionado: {output_format}. Capa: {cover_status}.")
             failures: list[str] = []
             completed_items = 0
             with YoutubeDL(options) as ydl:
@@ -606,6 +668,8 @@ class MainWindow(QMainWindow):
         self.selection_worker: CollectionInspectWorker | None = None
         self.update_thread: QThread | None = None
         self.update_worker: UpdateCheckWorker | None = None
+        self.available_releases: list[dict] = []
+        self._manual_update_check = False
         self._selection_start_after = False
         self._prepared_items_url: str | None = None
         self._prepared_items: list[dict] | None = None
@@ -647,6 +711,10 @@ class MainWindow(QMainWindow):
         brand.addWidget(subtitle)
         header.addLayout(brand)
         header.addStretch()
+        self.update_button = QPushButton("Atualizações")
+        self.update_button.setToolTip("Consultar Releases e escolher a versão para instalar.")
+        self.update_button.clicked.connect(self._open_update_center)
+        header.addWidget(self.update_button)
         version = QLabel(f"VERSÃO {APP_VERSION}")
         version.setObjectName("version")
         header.addWidget(version, alignment=Qt.AlignmentFlag.AlignTop)
@@ -689,10 +757,11 @@ class MainWindow(QMainWindow):
 
         self.audio_only = QCheckBox("Extrair apenas áudio (MP3)")
         self.audio_only.toggled.connect(self._toggle_audio)
-        self.thumbnail_check = QCheckBox("Baixar miniatura/capa em JPG e incorporar quando possível")
-        self.thumbnail_check.setChecked(True)
+        self.thumbnail_check = QCheckBox("Incorporar capa no MP3 (sem imagem JPG separada)")
+        self.thumbnail_check.setChecked(False)
+        self.thumbnail_check.setEnabled(False)
         self.thumbnail_check.setToolTip(
-            "Guarda a imagem do vídeo como JPG e incorpora a capa em MP3, MP4 ou MKV quando o formato suportar."
+            "Quando o áudio MP3 está ativo, incorpora a capa no quadrado da música e remove o JPG temporário."
         )
         card_layout.addLayout(controls)
         card_layout.addWidget(self.audio_only)
@@ -913,38 +982,72 @@ class MainWindow(QMainWindow):
         if now - last_checked < 24 * 60 * 60:
             return
         settings.setValue("updates/last_checked", now)
+        self._start_update_check(manual=False)
+
+    @Slot()
+    def _open_update_center(self) -> None:
+        self._start_update_check(manual=True)
+
+    def _start_update_check(self, manual: bool) -> None:
+        if self.update_thread and self.update_thread.isRunning():
+            return
+        self._manual_update_check = manual
+        self.update_button.setEnabled(False)
+        self.update_button.setText("A verificar…")
         self.update_thread = QThread(self)
         self.update_worker = UpdateCheckWorker(UPDATE_REPOSITORY, APP_VERSION)
         self.update_worker.moveToThread(self.update_thread)
         self.update_thread.started.connect(self.update_worker.run)
-        self.update_worker.available.connect(self._show_update_available)
+        self.update_worker.releases.connect(self._on_releases_ready)
         self.update_worker.failed.connect(self._update_check_failed)
-        self.update_worker.available.connect(self.update_thread.quit)
+        self.update_worker.releases.connect(self.update_thread.quit)
         self.update_worker.failed.connect(self.update_thread.quit)
         self.update_thread.finished.connect(self._update_thread_finished)
         self.update_thread.start()
 
-    @Slot(str, str, str)
-    def _show_update_available(self, version: str, release_url: str, installer_url: str) -> None:
-        target_url = installer_url or release_url
-        message = (
-            f"A versão {version} do MediaLivre está disponível.\n\n"
-            "Abra a página oficial para obter o instalador EXE atualizado?"
-        )
-        answer = QMessageBox.question(
-            self,
-            "Nova atualização disponível",
-            message,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            QDesktopServices.openUrl(QUrl(target_url))
+    @Slot(object)
+    def _on_releases_ready(self, releases: list[dict]) -> None:
+        self.available_releases = list(releases)
+        newer = [
+            release for release in releases
+            if version_tuple(release["version"]) > version_tuple(APP_VERSION)
+        ]
+        if newer:
+            latest = newer[0]["version"]
+            self.update_button.setText(f"Atualização {latest}")
+            self.update_button.setToolTip("Existe uma versão nova. Clique para escolher qualquer Release disponível.")
+        else:
+            self.update_button.setText("Atualizações")
+            self.update_button.setToolTip("Consultar Releases e escolher a versão para instalar.")
+        if self._manual_update_check:
+            self._show_release_selector(releases)
+
+    def _show_release_selector(self, releases: list[dict]) -> None:
+        if not releases:
+            QMessageBox.information(
+                self,
+                "Atualizações",
+                "Não foram encontradas Releases publicadas no repositório.",
+            )
+            return
+        dialog = ReleaseSelectionDialog(releases, APP_VERSION, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        release = dialog.selected_release() or {}
+        target_url = release.get("installer_url") or release.get("release_url")
+        if target_url:
+            QDesktopServices.openUrl(QUrl(str(target_url)))
 
     @Slot(str)
-    def _update_check_failed(self, _message: str) -> None:
-        # Update checks are optional; an offline or unavailable GitHub must not interrupt downloads.
-        return
+    def _update_check_failed(self, message: str) -> None:
+        if self._manual_update_check:
+            QMessageBox.warning(
+                self,
+                "Atualizações indisponíveis",
+                f"Não foi possível consultar as Releases agora.\n\n{message}",
+            )
+        self.update_button.setText("Atualizações")
+        self.update_button.setToolTip("Consultar Releases e escolher a versão para instalar.")
 
     @Slot()
     def _update_thread_finished(self) -> None:
@@ -954,6 +1057,8 @@ class MainWindow(QMainWindow):
             self.update_thread.deleteLater()
         self.update_worker = None
         self.update_thread = None
+        self._manual_update_check = False
+        self.update_button.setEnabled(True)
 
     def _schedule_current_download(self) -> None:
         url = self.url_input.text().strip()
@@ -1098,6 +1203,11 @@ class MainWindow(QMainWindow):
     def _toggle_audio(self, enabled: bool) -> None:
         self.quality.setEnabled(not enabled)
         self.video_format.setEnabled(not enabled)
+        self.thumbnail_check.setEnabled(enabled)
+        if enabled:
+            self.thumbnail_check.setChecked(True)
+        else:
+            self.thumbnail_check.setChecked(False)
 
     @Slot()
     def choose_destination(self) -> None:
@@ -1265,7 +1375,7 @@ class MainWindow(QMainWindow):
         self.quality.setEnabled(not busy and not self.audio_only.isChecked())
         self.video_format.setEnabled(not busy and not self.audio_only.isChecked())
         self.audio_only.setEnabled(not busy)
-        self.thumbnail_check.setEnabled(not busy)
+        self.thumbnail_check.setEnabled(not busy and self.audio_only.isChecked())
         self.playlist_check.setEnabled(not busy)
 
     @Slot()

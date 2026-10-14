@@ -7,7 +7,11 @@ import threading
 import unittest
 from pathlib import Path
 
-from medialivre import DownloadWorker
+from yt_dlp import YoutubeDL
+from yt_dlp.postprocessor.embedthumbnail import EmbedThumbnailPP
+from yt_dlp.postprocessor.ffmpeg import FFmpegThumbnailsConvertorPP
+
+from medialivre import DownloadWorker, ffmpeg_location, media_processing_options
 
 
 TOOLS_AVAILABLE = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -87,6 +91,59 @@ class LocalDownloadIntegrationTests(unittest.TestCase):
                     text=True,
                 )
                 self.assertIn(expected_format, probe.stdout.lower())
+
+    def test_mp3_embeds_cover_and_removes_separate_jpg(self):
+        audio = self.root / "cover-test.mp3"
+        cover = self.root / "cover-test.jpg"
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                "-q:a", "5", str(audio),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=yellow:s=128x128",
+                "-frames:v", "1", str(cover),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        info = {
+            "filepath": str(audio),
+            "ext": "mp3",
+            "id": "cover-test",
+            "title": "cover-test",
+            "thumbnails": [{
+                "filepath": str(cover),
+                "ext": "jpg",
+                "url": "https://example.invalid/cover.jpg",
+            }],
+        }
+        options = media_processing_options(True, True, "MP4")
+        ydl_options = {"quiet": True, "no_warnings": True}
+        if ffmpeg_location():
+            ydl_options["ffmpeg_location"] = str(ffmpeg_location())
+        with YoutubeDL(ydl_options) as ydl:
+            for pp in options["postprocessors"]:
+                if pp["key"] == "FFmpegThumbnailsConvertor":
+                    ydl.add_post_processor(FFmpegThumbnailsConvertorPP(ydl, format="jpg"))
+                elif pp["key"] == "EmbedThumbnail":
+                    ydl.add_post_processor(EmbedThumbnailPP(ydl, already_have_thumbnail=False))
+            ydl.run_all_pps("post_process", info)
+        self.assertTrue(audio.is_file())
+        self.assertFalse(cover.exists())
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(audio)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("video", probe.stdout.lower())
 
 
 if __name__ == "__main__":

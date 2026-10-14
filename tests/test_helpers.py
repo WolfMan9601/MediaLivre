@@ -80,21 +80,22 @@ class UrlValidationTests(unittest.TestCase):
 
 class UpdateCheckTests(unittest.TestCase):
     def test_detects_new_release_and_installer_asset(self):
-        payload = {
+        payload = [{
             "tag_name": "v0.9.0",
+            "name": "MediaLivre 0.9.0",
             "html_url": "https://github.com/WolfMan9601/MediaLivre/releases/tag/v0.9.0",
             "assets": [{
                 "name": "MediaLivre-Setup-0.9.0-win64.exe",
                 "browser_download_url": "https://github.com/WolfMan9601/MediaLivre/releases/download/v0.9.0/MediaLivre-Setup-0.9.0-win64.exe",
             }],
-        }
+        }]
         events = []
         worker = UpdateCheckWorker("WolfMan9601/MediaLivre", "0.8.0")
-        worker.available.connect(lambda *args: events.append(args))
+        worker.releases.connect(lambda releases: events.append(releases))
         with patch("medialivre.urlopen", return_value=io.BytesIO(json.dumps(payload).encode())):
             worker.run()
-        self.assertEqual(events[0][0], "v0.9.0")
-        self.assertTrue(events[0][2].endswith("MediaLivre-Setup-0.9.0-win64.exe"))
+        self.assertEqual(events[0][0]["version"], "v0.9.0")
+        self.assertTrue(events[0][0]["installer_url"].endswith("MediaLivre-Setup-0.9.0-win64.exe"))
 
 
 class FormatSelectionTests(unittest.TestCase):
@@ -133,13 +134,14 @@ class FormatSelectionTests(unittest.TestCase):
             [pp["key"] for pp in audio["postprocessors"]],
             ["FFmpegThumbnailsConvertor", "FFmpegExtractAudio", "EmbedThumbnail"],
         )
+        self.assertFalse(audio["postprocessors"][-1]["already_have_thumbnail"])
         avi = media_processing_options(True, False, "AVI")
         self.assertEqual(
             [pp["key"] for pp in avi["postprocessors"]],
-            ["FFmpegThumbnailsConvertor", "FFmpegVideoConvertor"],
+            ["FFmpegVideoConvertor"],
         )
         automatic = media_processing_options(True, False, "Automático")
-        self.assertEqual([pp["key"] for pp in automatic["postprocessors"]], ["FFmpegThumbnailsConvertor"])
+        self.assertNotIn("postprocessors", automatic)
         disabled = media_processing_options(False, False, "MP4")
         self.assertNotIn("writethumbnail", disabled)
 
