@@ -44,7 +44,7 @@ from download_scheduler import ScheduleStore, ScheduledDownload, default_databas
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.12.0"
+APP_VERSION = "0.12.1"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 
@@ -238,6 +238,8 @@ class InstallerDownloadWorker(QObject):
     def run(self) -> None:
         partial_path = self.target_path.with_name(f".{self.target_path.name}.part")
         try:
+            if not self.checksum_url:
+                raise ValueError("A Release não publicou o checksum SHA-256 deste instalador.")
             self.target_path.parent.mkdir(parents=True, exist_ok=True)
             partial_path.unlink(missing_ok=True)
             request = Request(
@@ -269,18 +271,17 @@ class InstallerDownloadWorker(QObject):
                 partial_path.unlink(missing_ok=True)
                 self.cancelled.emit()
                 return
-            if self.checksum_url:
-                self.status.emit("A validar a assinatura SHA-256…")
-                checksum_request = Request(
-                    self.checksum_url,
-                    headers={"Accept": "text/plain", "User-Agent": f"{APP_NAME}/{APP_VERSION}"},
-                )
-                with urlopen(checksum_request, timeout=15) as response:
-                    expected = extract_sha256(response.read().decode("utf-8", errors="replace"))
-                if not expected:
-                    raise ValueError("O ficheiro de checksum não contém um SHA-256 válido.")
-                if digest.hexdigest().lower() != expected:
-                    raise ValueError("A validação SHA-256 do instalador falhou; o ficheiro não será executado.")
+            self.status.emit("A validar a assinatura SHA-256…")
+            checksum_request = Request(
+                self.checksum_url,
+                headers={"Accept": "text/plain", "User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+            )
+            with urlopen(checksum_request, timeout=15) as response:
+                expected = extract_sha256(response.read().decode("utf-8", errors="replace"))
+            if not expected:
+                raise ValueError("O ficheiro de checksum não contém um SHA-256 válido.")
+            if digest.hexdigest().lower() != expected:
+                raise ValueError("A validação SHA-256 do instalador falhou; o ficheiro não será executado.")
             self.target_path.unlink(missing_ok=True)
             partial_path.replace(self.target_path)
             self.progress.emit(100)
@@ -523,7 +524,11 @@ class ReleaseSelectionDialog(QDialog):
         for release in releases:
             suffix = " (pré-lançamento)" if release.get("prerelease") else ""
             current = " (atual)" if version_tuple(release["version"]) == version_tuple(current_version) else ""
-            asset = " · instalador EXE" if release.get("installer_url") else " · sem instalador EXE"
+            asset = (
+                " · atualização automática disponível"
+                if release.get("installer_url") and release.get("checksum_url")
+                else " · sem instalador validado"
+            )
             self.release_combo.addItem(
                 f"{release['version']}{suffix}{current}{asset}",
                 release,
@@ -542,11 +547,11 @@ class ReleaseSelectionDialog(QDialog):
 
     def _update_detail(self, index: int) -> None:
         release = self.release_combo.itemData(index) or {}
-        if release.get("installer_url"):
+        if release.get("installer_url") and release.get("checksum_url"):
             target = "descarregará e validará o instalador automaticamente"
             self.open_button.setText("Atualizar automaticamente")
         else:
-            target = "abrirá a página da Release (sem instalador EXE)"
+            target = "abrirá a página da Release (sem instalador e checksum validados)"
             self.open_button.setText("Abrir página da Release")
         self.detail.setText(f"{release.get('name', release.get('version', ''))}\nAção: {target}.")
 
@@ -1150,7 +1155,7 @@ class MainWindow(QMainWindow):
             return
         release = dialog.selected_release() or {}
         installer_url = str(release.get("installer_url") or "")
-        if installer_url:
+        if installer_url and release.get("checksum_url"):
             self._start_installer_download(release)
         elif release.get("release_url"):
             QDesktopServices.openUrl(QUrl(str(release["release_url"])))

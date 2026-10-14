@@ -149,6 +149,20 @@ class UpdateCheckTests(unittest.TestCase):
             self.assertEqual(Path(events[0][1]).read_bytes(), payload_bytes)
             self.assertFalse(target.with_name(f".{target.name}.part").exists())
 
+    def test_download_worker_rejects_release_without_checksum(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "MediaLivre-Setup-test.exe"
+            events = []
+            worker = InstallerDownloadWorker(
+                "https://example.test/MediaLivre-Setup-test.exe",
+                "",
+                target,
+            )
+            worker.failed.connect(lambda message: events.append(message))
+            worker.run()
+            self.assertIn("checksum SHA-256", events[0])
+            self.assertFalse(target.exists())
+
 
 class FormatSelectionTests(unittest.TestCase):
     def test_quality_limit_is_applied(self):
