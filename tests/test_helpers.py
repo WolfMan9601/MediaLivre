@@ -108,6 +108,15 @@ class UrlValidationTests(unittest.TestCase):
         self.assertIn("sessão local do navegador", message)
         self.assertIn("não guarda a sua palavra-passe nem os cookies", message)
 
+    def test_instagram_cookie_database_error_explains_chrome_lock(self):
+        message = user_facing_download_error(
+            "ERROR: Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271",
+            "https://www.instagram.com/stories/artist/123/",
+        )
+        self.assertIn("Feche completamente o Chrome", message)
+        self.assertIn("Gestor de Tarefas", message)
+        self.assertIn("Edge/Firefox/Vivaldi", message)
+
     def test_normalizes_flat_collection_entries(self):
         items = collection_items({
             "entries": [

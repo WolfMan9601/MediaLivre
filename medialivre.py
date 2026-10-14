@@ -41,7 +41,7 @@ from download_scheduler import ScheduleStore, ScheduledDownload, default_databas
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.11.0"
+APP_VERSION = "0.11.1"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 
@@ -105,6 +105,14 @@ def user_facing_download_error(message: str, url: str) -> str:
         return (
             "Não foi possível encontrar a base de cookies do navegador escolhido. "
             "Confirme que o navegador está instalado e que existe uma sessão do Instagram."
+        )
+    if "could not copy" in lowered and "cookie database" in lowered:
+        return (
+            "O Chrome mantém a base de cookies bloqueada. Feche completamente o Chrome, "
+            "incluindo processos em segundo plano no Gestor de Tarefas, e tente novamente. "
+            "Também pode desativar «Continuar a executar aplicações em segundo plano» nas "
+            "definições do Chrome ou escolher Edge/Firefox/Vivaldi. O MediaLivre não consegue "
+            "ler a base enquanto o navegador a mantém bloqueada."
         )
     if "could not decrypt" in lowered or "decrypt" in lowered and "cookie" in lowered:
         return (
@@ -760,7 +768,7 @@ class DownloadWorker(QObject):
         self.log_line.emit(f"Aviso: {message}")
 
     def error(self, message: str) -> None:
-        self.log_line.emit(f"Erro: {message}")
+        self.log_line.emit(f"Erro: {user_facing_download_error(message, self.url)}")
 
 
 class MainWindow(QMainWindow):
