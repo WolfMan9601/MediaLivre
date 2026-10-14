@@ -9,7 +9,9 @@ from medialivre import (
     SkipCurrentItem,
     UpdateCheckWorker,
     collection_items,
+    collection_label,
     container_options,
+    is_instagram_stories_url,
     is_collection_url,
     is_http_url,
     media_processing_options,
@@ -65,6 +67,23 @@ class UrlValidationTests(unittest.TestCase):
         self.assertTrue(is_collection_url("https://www.instagram.com/artist/"))
         self.assertFalse(is_collection_url("https://www.instagram.com/reel/ABC123/"))
         self.assertFalse(is_collection_url("https://www.instagram.com/p/ABC123/"))
+
+    def test_detects_instagram_story_collections_and_single_stories(self):
+        story_urls = [
+            "https://www.instagram.com/stories/artist/",
+            "https://instagram.com/stories/artist?hl=pt",
+            "https://www.instagram.com/stories/highlights/18090946048123978/",
+        ]
+        for url in story_urls:
+            with self.subTest(url=url):
+                self.assertTrue(is_instagram_stories_url(url))
+                self.assertTrue(is_collection_url(url))
+                self.assertTrue(playlist_enabled(url, True))
+                self.assertEqual(collection_label(url), "Stories do Instagram")
+        single_story = "https://www.instagram.com/stories/artist/3570766765028588805/"
+        self.assertFalse(is_instagram_stories_url(single_story))
+        self.assertFalse(is_collection_url(single_story))
+        self.assertFalse(playlist_enabled(single_story, True))
 
     def test_normalizes_flat_collection_entries(self):
         items = collection_items({

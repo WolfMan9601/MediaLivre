@@ -41,7 +41,7 @@ from download_scheduler import ScheduleStore, ScheduledDownload, default_databas
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.10.0"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 
@@ -65,8 +65,42 @@ def is_http_url(value: str) -> bool:
         return False
 
 
+def is_instagram_stories_url(value: str) -> bool:
+    """Detect Instagram profile Stories and Highlights collections.
+
+    A URL ending with a numeric story id remains an individual item so it can be
+    downloaded directly without opening the collection picker.
+    """
+    try:
+        parsed = urlparse(value.strip())
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        parts = [part for part in parsed.path.lower().split("/") if part]
+        if parsed.scheme.lower() not in {"http", "https"} or host != "instagram.com":
+            return False
+        if len(parts) == 2 and parts[0] == "stories" and parts[1] != "highlights":
+            return True
+        return len(parts) == 3 and parts[0] == "stories" and parts[1] == "highlights"
+    except ValueError:
+        return False
+
+
+def collection_label(value: str) -> str:
+    """Return a user-facing name for the collection represented by a URL."""
+    if is_instagram_stories_url(value):
+        return "Stories do Instagram"
+    try:
+        parsed = urlparse(value.strip())
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.lower().rstrip("/")
+        if "instagram.com" in host and path and "/" not in path.strip("/"):
+            return "Perfil do Instagram"
+    except ValueError:
+        pass
+    return "Playlist/canal"
+
+
 def is_collection_url(value: str) -> bool:
-    """Detect playlist/channel URLs so a valid collection is not reduced to one item."""
+    """Detect playlist/channel/profile/Stories URLs so collections are not reduced to one item."""
     try:
         parsed = urlparse(value.strip())
         host = (parsed.hostname or "").lower()
@@ -87,6 +121,8 @@ def is_collection_url(value: str) -> bool:
             return path.startswith("/@") and "/video/" not in path
         if "instagram.com" in host:
             parts = [part for part in path.split("/") if part]
+            if is_instagram_stories_url(value):
+                return True
             return len(parts) == 1 and parts[0] not in {"reel", "reels", "p", "tv"}
         return False
     except ValueError:
@@ -336,8 +372,8 @@ class CollectionInspectWorker(QObject):
                 info = ydl.extract_info(self.url, download=False)
             items = collection_items(info or {})
             if not items:
-                raise ValueError("Não foram encontrados itens disponíveis nesta playlist/canal.")
-            title = str((info or {}).get("title") or (info or {}).get("playlist_title") or "Playlist/canal")
+                raise ValueError(f"Não foram encontrados itens disponíveis nesta {collection_label(self.url)}.")
+            title = str((info or {}).get("title") or (info or {}).get("playlist_title") or collection_label(self.url))
             self.found.emit(items, title)
         except Exception as exc:
             self.failed.emit(str(exc).strip() or exc.__class__.__name__)
@@ -350,7 +386,7 @@ class CollectionSelectionDialog(QDialog):
         self.setMinimumSize(720, 500)
         layout = QVBoxLayout(self)
         heading = QLabel(
-            f"{title}\nDesmarque as músicas ou vídeos que não pretende baixar. "
+            f"{title}\nDesmarque os itens que não pretende baixar. "
             "Pode saltar o item atual durante a transferência."
         )
         heading.setWordWrap(True)
@@ -474,7 +510,7 @@ class DownloadWorker(QObject):
         self.last_item_key = None
         self.current_position = 1
         self.total_items = 1
-        self.collection_title = "Transferência"
+        self.collection_title = collection_label(url)
 
     def cancel(self) -> None:
         self.cancel_requested.set()
@@ -544,9 +580,9 @@ class DownloadWorker(QObject):
         with YoutubeDL(inspect_options) as ydl:
             info = ydl.extract_info(self.url, download=False)
         items = collection_items(info or {})
-        self.collection_title = str((info or {}).get("title") or "Playlist/canal")
+        self.collection_title = str((info or {}).get("title") or collection_label(self.url))
         if not items:
-            raise ValueError("Não foram encontrados itens disponíveis nesta playlist/canal.")
+            raise ValueError(f"Não foram encontrados itens disponíveis nesta {collection_label(self.url)}.")
         return items
 
     def _download_options(self) -> dict:
@@ -587,7 +623,7 @@ class DownloadWorker(QObject):
             options = self._download_options()
             if collection_enabled:
                 self.log_line.emit(
-                    f"Playlist/canal: {self.total_items} item(ns) selecionado(s) para transferência."
+                    f"{collection_label(self.url)}: {self.total_items} item(ns) selecionado(s) para transferência."
                 )
             output_format = "MP3" if self.audio_only else (self.container or "Automático")
             cover_status = "incorporada no MP3" if self.audio_only and self.download_thumbnail else "não (vídeo sem JPG separado)"
@@ -705,7 +741,7 @@ class MainWindow(QMainWindow):
         brand = QVBoxLayout()
         title = QLabel("MediaLivre")
         title.setObjectName("title")
-        subtitle = QLabel("Transferências de YouTube, TikTok, Instagram e outras fontes suportadas.")
+        subtitle = QLabel("Transferências de YouTube, TikTok, Instagram Stories e outras fontes suportadas.")
         subtitle.setObjectName("subtitle")
         brand.addWidget(title)
         brand.addWidget(subtitle)
@@ -779,15 +815,15 @@ class MainWindow(QMainWindow):
         dest_row.addWidget(self.browse_button)
         card_layout.addLayout(dest_row)
 
-        self.playlist_check = QCheckBox("Transferir playlists e canais completos")
+        self.playlist_check = QCheckBox("Transferir playlists, canais e Stories completos")
         self.playlist_check.setChecked(True)
         self.playlist_check.setToolTip(
-            "Ao iniciar uma playlist ou canal, poderá escolher exatamente quais itens baixar."
+            "Ao iniciar uma playlist, canal ou Stories do Instagram, poderá escolher exatamente quais itens baixar."
         )
         playlist_row = QHBoxLayout()
         playlist_row.addWidget(self.playlist_check, 1)
         self.choose_items_button = QPushButton("Escolher itens")
-        self.choose_items_button.setToolTip("Ler a playlist/canal e selecionar músicas ou vídeos específicos.")
+        self.choose_items_button.setToolTip("Ler a playlist, canal ou Stories e selecionar itens específicos.")
         self.choose_items_button.clicked.connect(self._choose_collection_items)
         playlist_row.addWidget(self.choose_items_button)
         card_layout.addLayout(playlist_row)
@@ -894,7 +930,7 @@ class MainWindow(QMainWindow):
 
         notice = QLabel(
             "Use apenas com conteúdos que tem direito ou autorização para transferir. "
-            "O MediaLivre não contorna DRM, autenticação ou controlos de acesso. Algumas fontes, como o Instagram, podem exigir sessão/cookies."
+            "O MediaLivre não contorna DRM, autenticação ou controlos de acesso. Stories privados do Instagram podem exigir sessão/cookies; esta versão não os guarda."
         )
         notice.setObjectName("notice")
         notice.setWordWrap(True)
@@ -908,8 +944,8 @@ class MainWindow(QMainWindow):
         if not is_collection_url(url):
             QMessageBox.information(
                 self,
-                "Não é uma playlist/canal",
-                "Esta ligação parece ser um item individual. Pode iniciar o download diretamente.",
+                "Não é uma coleção",
+                "Esta ligação parece ser um item individual, como um vídeo ou Story. Pode iniciar o download diretamente.",
             )
             return
         self._begin_collection_selection(url, start_after=False)
@@ -920,7 +956,7 @@ class MainWindow(QMainWindow):
         if self.thread and self.thread.isRunning():
             return
         self._selection_start_after = start_after
-        self.status_label.setText("A ler a playlist/canal…")
+        self.status_label.setText("A ler a coleção…")
         self._set_busy(True)
         self.selection_thread = QThread(self)
         self.selection_worker = CollectionInspectWorker(url)
@@ -959,9 +995,9 @@ class MainWindow(QMainWindow):
     def _on_collection_failed(self, message: str) -> None:
         self._selection_start_after = False
         self._set_busy(False)
-        self.status_label.setText("Não foi possível ler a playlist/canal")
-        self._append_log(f"Erro ao ler a playlist/canal: {message}")
-        QMessageBox.warning(self, "Playlist indisponível", message)
+        self.status_label.setText("Não foi possível ler a coleção")
+        self._append_log(f"Erro ao ler a coleção: {message}")
+        QMessageBox.warning(self, "Coleção indisponível", message)
 
     @Slot()
     def _selection_thread_finished(self) -> None:
