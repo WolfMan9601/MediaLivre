@@ -1,9 +1,13 @@
 import unittest
+import io
+import json
 from pathlib import Path
+from unittest.mock import patch
 
 from medialivre import (
     DownloadWorker,
     SkipCurrentItem,
+    UpdateCheckWorker,
     collection_items,
     container_options,
     is_collection_url,
@@ -12,10 +16,16 @@ from medialivre import (
     playlist_enabled,
     progress_details,
     quality_format,
+    version_tuple,
 )
 
 
 class UrlValidationTests(unittest.TestCase):
+    def test_release_versions_are_comparable(self):
+        self.assertEqual(version_tuple("v0.8.0"), (0, 8, 0))
+        self.assertGreater(version_tuple("v0.9.0"), version_tuple("0.8.0"))
+        self.assertGreater(version_tuple("1.0"), version_tuple("0.99.9"))
+
     def test_accepts_absolute_http_and_https_urls(self):
         self.assertTrue(is_http_url("https://example.com/video?id=1"))
         self.assertTrue(is_http_url("http://example.com/path"))
@@ -66,6 +76,25 @@ class UrlValidationTests(unittest.TestCase):
         })
         self.assertEqual([item["index"] for item in items], [2, 3])
         self.assertEqual([item["title"] for item in items], ["Segundo", "Terceiro"])
+
+
+class UpdateCheckTests(unittest.TestCase):
+    def test_detects_new_release_and_installer_asset(self):
+        payload = {
+            "tag_name": "v0.9.0",
+            "html_url": "https://github.com/WolfMan9601/MediaLivre/releases/tag/v0.9.0",
+            "assets": [{
+                "name": "MediaLivre-Setup-0.9.0-win64.exe",
+                "browser_download_url": "https://github.com/WolfMan9601/MediaLivre/releases/download/v0.9.0/MediaLivre-Setup-0.9.0-win64.exe",
+            }],
+        }
+        events = []
+        worker = UpdateCheckWorker("WolfMan9601/MediaLivre", "0.8.0")
+        worker.available.connect(lambda *args: events.append(args))
+        with patch("medialivre.urlopen", return_value=io.BytesIO(json.dumps(payload).encode())):
+            worker.run()
+        self.assertEqual(events[0][0], "v0.9.0")
+        self.assertTrue(events[0][2].endswith("MediaLivre-Setup-0.9.0-win64.exe"))
 
 
 class FormatSelectionTests(unittest.TestCase):

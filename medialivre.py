@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+import re
 import sqlite3
 import sys
 import threading
@@ -8,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QUrl, QDateTime, QTimer, QLockFile
+from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QUrl, QDateTime, QTimer, QLockFile, QSettings
 from PySide6.QtGui import QDesktopServices, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -36,9 +38,11 @@ from PySide6.QtWidgets import (
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 from download_scheduler import ScheduleStore, ScheduledDownload, default_database_path
+from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
 APP_VERSION = "0.8.0"
+UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 
 def resource_path(*parts: str) -> Path:
@@ -119,6 +123,52 @@ def collection_items(info: dict) -> list[dict]:
             "url": item_url,
         })
     return items
+
+
+def version_tuple(value: str) -> tuple[int, ...]:
+    """Convert a vMAJOR.MINOR.PATCH tag into a comparable tuple."""
+    value = value.strip().lower().removeprefix("v")
+    match = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?", value)
+    if not match:
+        return (0,)
+    return tuple(int(part or 0) for part in match.groups())
+
+
+class UpdateCheckWorker(QObject):
+    available = Signal(str, str, str)
+    failed = Signal(str)
+
+    def __init__(self, repository: str, current_version: str) -> None:
+        super().__init__()
+        self.repository = repository
+        self.current_version = current_version
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            endpoint = f"https://api.github.com/repos/{self.repository}/releases/latest"
+            request = Request(
+                endpoint,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": f"{APP_NAME}/{self.current_version}",
+                },
+            )
+            with urlopen(request, timeout=10) as response:
+                release = json.load(response)
+            latest = str(release.get("tag_name") or "").strip()
+            release_url = str(release.get("html_url") or "").strip()
+            if not latest or not release_url or version_tuple(latest) <= version_tuple(self.current_version):
+                return
+            installer_url = ""
+            for asset in release.get("assets") or []:
+                name = str(asset.get("name") or "").lower()
+                if name.startswith("medialivre-setup-") and name.endswith(".exe"):
+                    installer_url = str(asset.get("browser_download_url") or "")
+                    break
+            self.available.emit(latest, release_url, installer_url)
+        except Exception as exc:
+            self.failed.emit(str(exc).strip() or exc.__class__.__name__)
 
 
 def ffmpeg_location() -> Path | None:
@@ -554,6 +604,8 @@ class MainWindow(QMainWindow):
         self.worker: DownloadWorker | None = None
         self.selection_thread: QThread | None = None
         self.selection_worker: CollectionInspectWorker | None = None
+        self.update_thread: QThread | None = None
+        self.update_worker: UpdateCheckWorker | None = None
         self._selection_start_after = False
         self._prepared_items_url: str | None = None
         self._prepared_items: list[dict] | None = None
@@ -569,6 +621,7 @@ class MainWindow(QMainWindow):
         self.schedule_timer.timeout.connect(self._run_due_schedules)
         self.schedule_timer.start(5000)
         QTimer.singleShot(0, self._run_due_schedules)
+        QTimer.singleShot(1500, self._check_for_updates)
 
     def _build_ui(self) -> None:
         scroll = QScrollArea()
@@ -849,6 +902,58 @@ class MainWindow(QMainWindow):
             self.selection_thread.deleteLater()
         self.selection_worker = None
         self.selection_thread = None
+
+    def _check_for_updates(self) -> None:
+        settings = QSettings(APP_NAME, APP_NAME)
+        try:
+            last_checked = int(settings.value("updates/last_checked", 0))
+        except (TypeError, ValueError):
+            last_checked = 0
+        now = int(datetime.now(timezone.utc).timestamp())
+        if now - last_checked < 24 * 60 * 60:
+            return
+        settings.setValue("updates/last_checked", now)
+        self.update_thread = QThread(self)
+        self.update_worker = UpdateCheckWorker(UPDATE_REPOSITORY, APP_VERSION)
+        self.update_worker.moveToThread(self.update_thread)
+        self.update_thread.started.connect(self.update_worker.run)
+        self.update_worker.available.connect(self._show_update_available)
+        self.update_worker.failed.connect(self._update_check_failed)
+        self.update_worker.available.connect(self.update_thread.quit)
+        self.update_worker.failed.connect(self.update_thread.quit)
+        self.update_thread.finished.connect(self._update_thread_finished)
+        self.update_thread.start()
+
+    @Slot(str, str, str)
+    def _show_update_available(self, version: str, release_url: str, installer_url: str) -> None:
+        target_url = installer_url or release_url
+        message = (
+            f"A versão {version} do MediaLivre está disponível.\n\n"
+            "Abra a página oficial para obter o instalador EXE atualizado?"
+        )
+        answer = QMessageBox.question(
+            self,
+            "Nova atualização disponível",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl(target_url))
+
+    @Slot(str)
+    def _update_check_failed(self, _message: str) -> None:
+        # Update checks are optional; an offline or unavailable GitHub must not interrupt downloads.
+        return
+
+    @Slot()
+    def _update_thread_finished(self) -> None:
+        if self.update_worker:
+            self.update_worker.deleteLater()
+        if self.update_thread:
+            self.update_thread.deleteLater()
+        self.update_worker = None
+        self.update_thread = None
 
     def _schedule_current_download(self) -> None:
         url = self.url_input.text().strip()

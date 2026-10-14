@@ -1,0 +1,80 @@
+name: Build and publish Windows installer
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Resolve release version
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "The tag must use vMAJOR.MINOR.PATCH, for example v0.9.0"
+          }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Synchronize application version
+        shell: pwsh
+        run: |
+          $version = $env:VERSION
+          $files = @('medialivre.py', 'installer_windows.iss', 'create_installer_windows.bat')
+          foreach ($path in $files) {
+            $content = Get-Content -Raw -Path $path
+            $content = [regex]::Replace($content, 'APP_VERSION = "[^"]+"', "APP_VERSION = `"$version`"")
+            $content = [regex]::Replace($content, '#define AppVersion "[^"]+"', "#define AppVersion `"$version`"")
+            $content = [regex]::Replace($content, 'MediaLivre-Setup-\d+\.\d+\.\d+-win64\.exe', "MediaLivre-Setup-$version-win64.exe")
+            Set-Content -Path $path -Value $content -Encoding utf8
+          }
+
+      - name: Build installer
+        shell: cmd
+        run: call create_installer_windows.bat
+
+      - name: Verify installer and write checksum
+        shell: pwsh
+        run: |
+          $setup = "MediaLivre-Setup-$env:VERSION-win64.exe"
+          if (!(Test-Path $setup)) {
+            throw "Installer not found: $setup"
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $setup).Hash.ToLower()
+          "$hash  $setup" | Set-Content -Path "$setup.sha256" -Encoding ascii
+          Write-Host "Created $setup"
+          Write-Host "SHA-256: $hash"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MediaLivre-Windows-${{ env.VERSION }}
+          path: |
+            MediaLivre-Setup-${{ env.VERSION }}-win64.exe
+            MediaLivre-Setup-${{ env.VERSION }}-win64.exe.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: MediaLivre ${{ env.VERSION }}
+          generate_release_notes: true
+          files: |
+            MediaLivre-Setup-${{ env.VERSION }}-win64.exe
+            MediaLivre-Setup-${{ env.VERSION }}-win64.exe.sha256

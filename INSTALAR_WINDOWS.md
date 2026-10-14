@@ -20,6 +20,17 @@ O instalador Windows precisa de ser compilado no Windows. Nesta sessão Linux n�
 
 FFmpeg, ffprobe e mutagen ficam incluídos no bundle do instalador. O utilizador final não precisa de os instalar separadamente para combinar streams, converter para MP3/MKV/AVI ou incorporar capas. A opção de miniatura guarda também uma imagem JPG ao lado da mídia.
 
+## Publicar atualizações
+
+O workflow `.github/workflows/windows-release.yml` cria o instalador na nuvem através de um runner Windows quando uma tag `vMAJOR.MINOR.PATCH` é enviada para o repositório. Por exemplo:
+
+```bash
+git tag v0.9.0
+git push origin v0.9.0
+```
+
+O workflow publica o `.exe` e o respetivo SHA-256 na GitHub Release. O MediaLivre verifica diariamente a Release mais recente de `WolfMan9601/MediaLivre` e avisa quando a versão é superior à instalada. A atualização é iniciada pelo utilizador através do instalador oficial; não há execução silenciosa de ficheiros baixados.
+
 ## Se o PowerShell bloquear scripts
 
 Não é necessário ativar a virtualenv. Os scripts `.bat` chamam diretamente `.venv\Scripts\python.exe`. Também pode executar a app com:
