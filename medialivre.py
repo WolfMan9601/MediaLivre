@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QCheckBox,
     QDateTimeEdit,
+    QDialog,
+    QDialogButtonBox,
     QListWidget,
     QListWidgetItem,
     QTextEdit,
@@ -36,7 +38,7 @@ from yt_dlp.utils import DownloadError
 from download_scheduler import ScheduleStore, ScheduledDownload, default_database_path
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 
 
 def resource_path(*parts: str) -> Path:
@@ -63,25 +65,60 @@ def is_collection_url(value: str) -> bool:
     """Detect playlist/channel URLs so a valid collection is not reduced to one item."""
     try:
         parsed = urlparse(value.strip())
-        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme.lower() not in {"http", "https"} or not host:
             return False
         path = parsed.path.lower().rstrip("/")
         query = parsed.query.lower()
-        collection_path = (
-            "/playlist" in path
-            or "/channel/" in path
-            or path.startswith("/c/")
-            or path.startswith("/user/")
-            or path.startswith("/@")
-        )
-        return collection_path or "list=" in query
+        if "list=" in query or "/playlist" in path:
+            return True
+        if "youtube.com" in host or host == "youtu.be":
+            return (
+                "/channel/" in path
+                or path.startswith("/c/")
+                or path.startswith("/user/")
+                or (path.startswith("/@") and "/watch" not in path)
+            )
+        if "tiktok.com" in host:
+            return path.startswith("/@") and "/video/" not in path
+        if "instagram.com" in host:
+            parts = [part for part in path.split("/") if part]
+            return len(parts) == 1 and parts[0] not in {"reel", "reels", "p", "tv"}
+        return False
     except ValueError:
         return False
 
 
 def playlist_enabled(url: str, requested: bool) -> bool:
-    """Keep an explicit user request or auto-enable collection URLs."""
-    return bool(requested or is_collection_url(url))
+    """Expand a collection only when the user left collection downloads enabled."""
+    return bool(requested and is_collection_url(url))
+
+
+def collection_items(info: dict) -> list[dict]:
+    """Normalize flat yt-dlp collection entries for the picker and worker."""
+    items: list[dict] = []
+    for position, entry in enumerate(info.get("entries") or [], start=1):
+        if not entry:
+            continue
+        item_url = (
+            entry.get("webpage_url")
+            or entry.get("original_url")
+            or entry.get("url")
+            or ""
+        )
+        if not isinstance(item_url, str) or not item_url.startswith(("http://", "https://")):
+            continue
+        try:
+            index = int(entry.get("playlist_index") or position)
+        except (TypeError, ValueError):
+            index = position
+        items.append({
+            "index": index,
+            "id": str(entry.get("id") or index),
+            "title": str(entry.get("title") or f"Item {index}"),
+            "url": item_url,
+        })
+    return items
 
 
 def ffmpeg_location() -> Path | None:
@@ -207,9 +244,102 @@ def progress_details(data: dict) -> tuple[int, int, str, str]:
     return max(0, min(100, overall)), item_percent, item_label, batch_label
 
 
+class CollectionInspectWorker(QObject):
+    found = Signal(object, str)
+    failed = Signal(str)
+
+    def __init__(self, url: str) -> None:
+        super().__init__()
+        self.url = url
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            options = {
+                "extract_flat": True,
+                "skip_download": True,
+                "noplaylist": False,
+                "ignoreerrors": True,
+                "quiet": True,
+                "no_warnings": False,
+                "socket_timeout": 20,
+            }
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(self.url, download=False)
+            items = collection_items(info or {})
+            if not items:
+                raise ValueError("Não foram encontrados itens disponíveis nesta playlist/canal.")
+            title = str((info or {}).get("title") or (info or {}).get("playlist_title") or "Playlist/canal")
+            self.found.emit(items, title)
+        except Exception as exc:
+            self.failed.emit(str(exc).strip() or exc.__class__.__name__)
+
+
+class CollectionSelectionDialog(QDialog):
+    def __init__(self, title: str, items: list[dict], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Escolher itens para transferir")
+        self.setMinimumSize(720, 500)
+        layout = QVBoxLayout(self)
+        heading = QLabel(
+            f"{title}\nDesmarque as músicas ou vídeos que não pretende baixar. "
+            "Pode saltar o item atual durante a transferência."
+        )
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+        self.items_list = QListWidget()
+        self.items_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        for item in items:
+            row = QListWidgetItem(f"{item['index']}. {item['title']}")
+            row.setData(Qt.ItemDataRole.UserRole, item)
+            row.setFlags(row.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            row.setCheckState(Qt.CheckState.Checked)
+            row.setToolTip(item["url"])
+            self.items_list.addItem(row)
+        layout.addWidget(self.items_list, 1)
+        actions = QHBoxLayout()
+        select_all = QPushButton("Selecionar todos")
+        clear_all = QPushButton("Limpar seleção")
+        select_all.clicked.connect(lambda: self._set_all(Qt.CheckState.Checked))
+        clear_all.clicked.connect(lambda: self._set_all(Qt.CheckState.Unchecked))
+        actions.addWidget(select_all)
+        actions.addWidget(clear_all)
+        actions.addStretch()
+        layout.addLayout(actions)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_if_selected)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _set_all(self, state: Qt.CheckState) -> None:
+        for index in range(self.items_list.count()):
+            self.items_list.item(index).setCheckState(state)
+
+    def _accept_if_selected(self) -> None:
+        if not self.selected_items():
+            QMessageBox.warning(self, "Nenhum item selecionado", "Marque pelo menos um item para continuar.")
+            return
+        self.accept()
+
+    def selected_items(self) -> list[dict]:
+        selected: list[dict] = []
+        for index in range(self.items_list.count()):
+            row = self.items_list.item(index)
+            if row.checkState() == Qt.CheckState.Checked:
+                selected.append(row.data(Qt.ItemDataRole.UserRole))
+        return selected
+
+
+class SkipCurrentItem(Exception):
+    """Internal control flow used to skip the active playlist entry."""
+
+
 class DownloadWorker(QObject):
     progress = Signal(int, str)
     item_progress = Signal(int, str)
+    item_started = Signal(str)
     log_line = Signal(str)
     completed = Signal(str)
     failed = Signal(str)
@@ -217,7 +347,7 @@ class DownloadWorker(QObject):
 
     def __init__(self, url: str, destination: Path, quality: str,
                  audio_only: bool, allow_playlist: bool, container: str = "Automático",
-                 download_thumbnail: bool = True) -> None:
+                 download_thumbnail: bool = True, selected_items: list[dict] | None = None) -> None:
         super().__init__()
         self.url = url
         self.destination = destination
@@ -226,20 +356,42 @@ class DownloadWorker(QObject):
         self.allow_playlist = allow_playlist
         self.container = container
         self.download_thumbnail = download_thumbnail
+        self.selected_items = selected_items
         self.cancel_requested = threading.Event()
+        self.skip_requested = threading.Event()
         self.last_percent = -1
         self.last_item_key = None
+        self.current_position = 1
+        self.total_items = 1
+        self.collection_title = "Transferência"
 
     def cancel(self) -> None:
         self.cancel_requested.set()
 
+    def skip_current_item(self) -> None:
+        self.skip_requested.set()
+
     def _progress_hook(self, data: dict) -> None:
         if self.cancel_requested.is_set():
             raise DownloadError("Transferência cancelada pelo utilizador.")
+        if self.skip_requested.is_set():
+            self.skip_requested.clear()
+            raise SkipCurrentItem()
         status = data.get("status")
         if status == "downloading":
-            overall, percent, item_label, batch_label = progress_details(data)
+            _overall, percent, item_label, batch_label = progress_details(data)
             info = data.get("info_dict") or {}
+            if self.total_items > 1:
+                title = str(info.get("title") or "A preparar o item…")
+                item_label = f"Item {self.current_position}/{self.total_items} · {title}"
+                batch_label = (
+                    f"{self.collection_title} · item {self.current_position} de {self.total_items}"
+                )
+                overall = int(
+                    ((self.current_position - 1 + percent / 100) / self.total_items) * 100
+                )
+            else:
+                overall = _overall
             item_key = (info.get("playlist_index"), info.get("id"), info.get("title"))
             if percent != self.last_percent or item_key != self.last_item_key:
                 self.last_percent = percent
@@ -250,49 +402,122 @@ class DownloadWorker(QObject):
                 self.progress.emit(overall, " · ".join(x for x in (batch_label, detail) if x))
                 self.item_progress.emit(percent, item_label)
         elif status == "finished":
-            overall, percent, item_label, batch_label = progress_details(data)
+            _overall, percent, item_label, batch_label = progress_details(data)
+            if self.total_items > 1:
+                title = str((data.get("info_dict") or {}).get("title") or item_label)
+                item_label = f"Item {self.current_position}/{self.total_items} · {title}"
+                batch_label = (
+                    f"{self.collection_title} · item {self.current_position} de {self.total_items}"
+                )
+                overall = int(
+                    ((self.current_position - 1 + percent / 100) / self.total_items) * 100
+                )
+            else:
+                overall = _overall
             self.progress.emit(overall, f"{batch_label} · a preparar o ficheiro…")
             self.item_progress.emit(percent, item_label)
+
+    def _resolve_items(self, collection_enabled: bool) -> list[dict]:
+        if self.selected_items is not None:
+            return list(self.selected_items)
+        if not collection_enabled:
+            return [{"index": 1, "id": "single", "title": self.url, "url": self.url}]
+        inspect_options = {
+            "extract_flat": True,
+            "skip_download": True,
+            "noplaylist": False,
+            "ignoreerrors": True,
+            "quiet": True,
+            "socket_timeout": 20,
+        }
+        with YoutubeDL(inspect_options) as ydl:
+            info = ydl.extract_info(self.url, download=False)
+        items = collection_items(info or {})
+        self.collection_title = str((info or {}).get("title") or "Playlist/canal")
+        if not items:
+            raise ValueError("Não foram encontrados itens disponíveis nesta playlist/canal.")
+        return items
+
+    def _download_options(self) -> dict:
+        options: dict = {
+            "format": quality_format(self.quality, self.audio_only, self.container),
+            "outtmpl": str(self.destination / "%(title).180B [%(id)s].%(ext)s"),
+            "noplaylist": True,
+            "windowsfilenames": True,
+            "restrictfilenames": False,
+            "continuedl": True,
+            "overwrites": False,
+            "progress_hooks": [self._progress_hook],
+            "quiet": True,
+            "no_warnings": False,
+            "logger": self,
+            "ignoreerrors": False,
+            "socket_timeout": 20,
+            "retries": 3,
+            "fragment_retries": 3,
+        }
+        location = ffmpeg_location()
+        if location:
+            options["ffmpeg_location"] = str(location)
+        elif self.container != "Automático" or self.audio_only:
+            self.log_line.emit("Aviso: FFmpeg/ffprobe não encontrado; conversão de formato pode falhar.")
+        options.update(media_processing_options(self.download_thumbnail, self.audio_only, self.container))
+        return options
 
     @Slot()
     def run(self) -> None:
         try:
             self.destination.mkdir(parents=True, exist_ok=True)
             collection_enabled = playlist_enabled(self.url, self.allow_playlist)
-            options: dict = {
-                "format": quality_format(self.quality, self.audio_only, self.container),
-                "outtmpl": str(self.destination / "%(title).180B [%(id)s].%(ext)s"),
-                "noplaylist": not collection_enabled,
-                "windowsfilenames": True,
-                "restrictfilenames": False,
-                "continuedl": True,
-                "overwrites": False,
-                "progress_hooks": [self._progress_hook],
-                "quiet": True,
-                "no_warnings": False,
-                "logger": self,
-                "ignoreerrors": False,
-                "socket_timeout": 20,
-                "retries": 3,
-                "fragment_retries": 3,
-            }
+            items = self._resolve_items(collection_enabled)
+            if not items:
+                raise ValueError("Nenhum item foi selecionado para transferência.")
+            self.total_items = len(items)
+            options = self._download_options()
             if collection_enabled:
-                # Explicitly request the complete collection, not only the first entry.
-                options["playlist_items"] = "1-"
-                self.log_line.emit("Playlist/canal detetado: a preparar todos os itens disponíveis…")
-            location = ffmpeg_location()
-            if location:
-                options["ffmpeg_location"] = str(location)
-            elif self.container != "Automático" or self.audio_only:
-                self.log_line.emit("Aviso: FFmpeg/ffprobe não encontrado; conversão de formato pode falhar.")
-            options.update(media_processing_options(self.download_thumbnail, self.audio_only, self.container))
+                self.log_line.emit(
+                    f"Playlist/canal: {self.total_items} item(ns) selecionado(s) para transferência."
+                )
             output_format = "MP3" if self.audio_only else (self.container or "Automático")
             self.log_line.emit(f"Formato selecionado: {output_format}. Miniatura/capa: {'sim' if self.download_thumbnail else 'não'}.")
-            self.log_line.emit("A obter informações da fonte…")
+            failures: list[str] = []
+            completed_items = 0
             with YoutubeDL(options) as ydl:
-                ydl.download([self.url])
+                for position, item in enumerate(items, start=1):
+                    if self.cancel_requested.is_set():
+                        self.cancelled.emit()
+                        return
+                    self.current_position = position
+                    self.last_percent = -1
+                    self.last_item_key = None
+                    self.skip_requested.clear()
+                    self.log_line.emit(f"A iniciar item {position}/{self.total_items}: {item['title']}")
+                    self.item_started.emit(str(item["title"]))
+                    try:
+                        ydl.download([item["url"]])
+                    except SkipCurrentItem:
+                        self.log_line.emit(f"Item ignorado: {item['title']}")
+                        self.progress.emit(
+                            int(position * 100 / self.total_items),
+                            f"Item {position}/{self.total_items} ignorado",
+                        )
+                        self.item_progress.emit(100, f"Item {position}/{self.total_items} · ignorado")
+                        continue
+                    except DownloadError as exc:
+                        if self.cancel_requested.is_set():
+                            self.cancelled.emit()
+                            return
+                        message = str(exc).strip() or "erro desconhecido"
+                        failures.append(f"{item['title']}: {message}")
+                        self.log_line.emit(f"Erro no item {position}/{self.total_items}: {message}")
+                        if self.total_items == 1:
+                            raise
+                        continue
+                    completed_items += 1
             if self.cancel_requested.is_set():
                 self.cancelled.emit()
+            elif failures and completed_items == 0:
+                self.failed.emit("Nenhum item foi transferido com sucesso.\n" + "\n".join(failures))
             else:
                 self.progress.emit(100, "Concluído")
                 self.completed.emit(str(self.destination))
@@ -327,6 +552,11 @@ class MainWindow(QMainWindow):
         self.resize(940, 760)
         self.thread: QThread | None = None
         self.worker: DownloadWorker | None = None
+        self.selection_thread: QThread | None = None
+        self.selection_worker: CollectionInspectWorker | None = None
+        self._selection_start_after = False
+        self._prepared_items_url: str | None = None
+        self._prepared_items: list[dict] | None = None
         self._active_schedule_id: str | None = None
         self._close_when_idle = False
         self.destination = Path.home() / "Downloads"
@@ -358,7 +588,7 @@ class MainWindow(QMainWindow):
         brand = QVBoxLayout()
         title = QLabel("MediaLivre")
         title.setObjectName("title")
-        subtitle = QLabel("Transferências simples. Código aberto.")
+        subtitle = QLabel("Transferências de YouTube, TikTok, Instagram e outras fontes suportadas.")
         subtitle.setObjectName("subtitle")
         brand.addWidget(title)
         brand.addWidget(subtitle)
@@ -427,12 +657,18 @@ class MainWindow(QMainWindow):
         dest_row.addWidget(self.browse_button)
         card_layout.addLayout(dest_row)
 
-        self.playlist_check = QCheckBox("Transferir playlists e canais completos automaticamente")
+        self.playlist_check = QCheckBox("Transferir playlists e canais completos")
         self.playlist_check.setChecked(True)
         self.playlist_check.setToolTip(
-            "URLs de playlist/canal são detetados automaticamente. Desmarque para limitar uma URL com lista ao vídeo atual."
+            "Ao iniciar uma playlist ou canal, poderá escolher exatamente quais itens baixar."
         )
-        card_layout.addWidget(self.playlist_check)
+        playlist_row = QHBoxLayout()
+        playlist_row.addWidget(self.playlist_check, 1)
+        self.choose_items_button = QPushButton("Escolher itens")
+        self.choose_items_button.setToolTip("Ler a playlist/canal e selecionar músicas ou vídeos específicos.")
+        self.choose_items_button.clicked.connect(self._choose_collection_items)
+        playlist_row.addWidget(self.choose_items_button)
+        card_layout.addLayout(playlist_row)
         layout.addWidget(card)
 
         schedule_card = QFrame()
@@ -476,12 +712,17 @@ class MainWindow(QMainWindow):
         self.start_button = QPushButton("Iniciar transferência")
         self.start_button.setObjectName("primary")
         self.start_button.clicked.connect(lambda _checked=False: self.start_download())
+        self.skip_button = QPushButton("Saltar item")
+        self.skip_button.setEnabled(False)
+        self.skip_button.setToolTip("Ignorar apenas o item atual e continuar com os seguintes.")
+        self.skip_button.clicked.connect(self.skip_current_item)
         self.cancel_button = QPushButton("Cancelar")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_download)
         self.open_button = QPushButton("Abrir pasta")
         self.open_button.clicked.connect(self.open_destination)
         action_row.addWidget(self.start_button, 1)
+        action_row.addWidget(self.skip_button)
         action_row.addWidget(self.cancel_button)
         action_row.addWidget(self.open_button)
         layout.addLayout(action_row)
@@ -531,11 +772,83 @@ class MainWindow(QMainWindow):
 
         notice = QLabel(
             "Use apenas com conteúdos que tem direito ou autorização para transferir. "
-            "O MediaLivre não contorna DRM, autenticação ou controlos de acesso."
+            "O MediaLivre não contorna DRM, autenticação ou controlos de acesso. Algumas fontes, como o Instagram, podem exigir sessão/cookies."
         )
         notice.setObjectName("notice")
         notice.setWordWrap(True)
         layout.addWidget(notice)
+
+    def _choose_collection_items(self) -> None:
+        url = self.url_input.text().strip()
+        if not is_http_url(url):
+            QMessageBox.warning(self, "Ligação inválida", "Introduza uma ligação HTTP(S) antes de escolher itens.")
+            return
+        if not is_collection_url(url):
+            QMessageBox.information(
+                self,
+                "Não é uma playlist/canal",
+                "Esta ligação parece ser um item individual. Pode iniciar o download diretamente.",
+            )
+            return
+        self._begin_collection_selection(url, start_after=False)
+
+    def _begin_collection_selection(self, url: str, start_after: bool) -> None:
+        if self.selection_thread and self.selection_thread.isRunning():
+            return
+        if self.thread and self.thread.isRunning():
+            return
+        self._selection_start_after = start_after
+        self.status_label.setText("A ler a playlist/canal…")
+        self._set_busy(True)
+        self.selection_thread = QThread(self)
+        self.selection_worker = CollectionInspectWorker(url)
+        self.selection_worker.moveToThread(self.selection_thread)
+        self.selection_thread.started.connect(self.selection_worker.run)
+        self.selection_worker.found.connect(self._on_collection_found)
+        self.selection_worker.failed.connect(self._on_collection_failed)
+        self.selection_worker.found.connect(self.selection_thread.quit)
+        self.selection_worker.failed.connect(self.selection_thread.quit)
+        self.selection_thread.finished.connect(self._selection_thread_finished)
+        self.selection_thread.start()
+
+    @Slot(object, str)
+    def _on_collection_found(self, items: list[dict], title: str) -> None:
+        url = self.url_input.text().strip()
+        dialog = CollectionSelectionDialog(title, items, self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        selected = dialog.selected_items() if accepted else []
+        start_after = self._selection_start_after
+        self._selection_start_after = False
+        self._set_busy(False)
+        if not selected:
+            self._prepared_items_url = None
+            self._prepared_items = None
+            self.status_label.setText("Seleção cancelada")
+            return
+        if start_after:
+            self.start_download(selected_items=selected)
+        else:
+            self._prepared_items_url = url
+            self._prepared_items = selected
+            self.status_label.setText(f"{len(selected)} item(ns) selecionado(s); pronto para começar")
+            self._append_log(f"Seleção guardada: {len(selected)} de {len(items)} item(ns).")
+
+    @Slot(str)
+    def _on_collection_failed(self, message: str) -> None:
+        self._selection_start_after = False
+        self._set_busy(False)
+        self.status_label.setText("Não foi possível ler a playlist/canal")
+        self._append_log(f"Erro ao ler a playlist/canal: {message}")
+        QMessageBox.warning(self, "Playlist indisponível", message)
+
+    @Slot()
+    def _selection_thread_finished(self) -> None:
+        if self.selection_worker:
+            self.selection_worker.deleteLater()
+        if self.selection_thread:
+            self.selection_thread.deleteLater()
+        self.selection_worker = None
+        self.selection_thread = None
 
     def _schedule_current_download(self) -> None:
         url = self.url_input.text().strip()
@@ -689,7 +1002,11 @@ class MainWindow(QMainWindow):
             self.destination_text.setText(selected)
 
     @Slot()
-    def start_download(self, scheduled_job: ScheduledDownload | None = None) -> None:
+    def start_download(
+        self,
+        scheduled_job: ScheduledDownload | None = None,
+        selected_items: list[dict] | None = None,
+    ) -> None:
         if scheduled_job:
             options = scheduled_job.options
             self.url_input.setText(scheduled_job.url)
@@ -697,7 +1014,7 @@ class MainWindow(QMainWindow):
             self.video_format.setCurrentText(str(options.get("container", "Automático")))
             self.audio_only.setChecked(bool(options.get("audio_only", False)))
             self.thumbnail_check.setChecked(bool(options.get("download_thumbnail", True)))
-            self.playlist_check.setChecked(bool(options.get("allow_playlist", False)))
+            self.playlist_check.setChecked(bool(options.get("allow_playlist", True)))
             self.destination = Path(options.get("destination") or self.destination)
             self.destination_text.setText(str(self.destination))
         self._active_schedule_id = scheduled_job.id if scheduled_job else None
@@ -714,6 +1031,14 @@ class MainWindow(QMainWindow):
             return
         if self.thread and self.thread.isRunning():
             return
+        if scheduled_job is None and selected_items is None:
+            if self._prepared_items_url == url and self._prepared_items is not None:
+                selected_items = self._prepared_items
+                self._prepared_items_url = None
+                self._prepared_items = None
+            elif playlist_enabled(url, self.playlist_check.isChecked()):
+                self._begin_collection_selection(url, start_after=True)
+                return
         self.log.clear()
         self.progress.setValue(0)
         self.percent_label.setText("0%")
@@ -732,11 +1057,13 @@ class MainWindow(QMainWindow):
             allow_playlist=self.playlist_check.isChecked(),
             container=self.video_format.currentText(),
             download_thumbnail=self.thumbnail_check.isChecked(),
+            selected_items=selected_items,
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self._on_progress)
         self.worker.item_progress.connect(self._on_item_progress)
+        self.worker.item_started.connect(self._on_item_started)
         self.worker.log_line.connect(self._append_log)
         self.worker.completed.connect(self._on_completed)
         self.worker.failed.connect(self._on_failed)
@@ -745,6 +1072,8 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.thread.quit)
         self.worker.cancelled.connect(self.thread.quit)
         self.thread.finished.connect(self._thread_finished)
+        self.cancel_button.setEnabled(True)
+        self.skip_button.setEnabled(bool(is_collection_url(url) or (selected_items and len(selected_items) > 1)))
         self.thread.start()
 
     @Slot()
@@ -753,7 +1082,16 @@ class MainWindow(QMainWindow):
             self.worker.cancel()
             self.status_label.setText("A cancelar com segurança…")
             self.cancel_button.setEnabled(False)
+            self.skip_button.setEnabled(False)
             self._append_log("Cancelamento solicitado; a transferência será interrompida no próximo ponto seguro.")
+
+    @Slot()
+    def skip_current_item(self) -> None:
+        if self.worker:
+            self.worker.skip_current_item()
+            self.skip_button.setEnabled(False)
+            self.status_label.setText("A saltar o item atual…")
+            self._append_log("Salto solicitado; o item atual será ignorado no próximo ponto seguro.")
 
     @Slot(int, str)
     def _on_progress(self, percent: int, detail: str) -> None:
@@ -766,6 +1104,11 @@ class MainWindow(QMainWindow):
         self.item_progress_bar.setValue(percent)
         self.item_percent.setText(f"{percent}%")
         self.item_label.setText(item_label)
+
+    @Slot(str)
+    def _on_item_started(self, _title: str) -> None:
+        if self.worker and self.worker.total_items > 1 and self.cancel_button.isEnabled():
+            self.skip_button.setEnabled(True)
 
     @Slot(str)
     def _append_log(self, text: str) -> None:
@@ -809,8 +1152,10 @@ class MainWindow(QMainWindow):
 
     def _set_busy(self, busy: bool) -> None:
         self.start_button.setEnabled(not busy)
-        self.cancel_button.setEnabled(busy)
+        self.cancel_button.setEnabled(busy and self.worker is not None)
+        self.skip_button.setEnabled(busy and self.worker is not None)
         self.browse_button.setEnabled(not busy)
+        self.choose_items_button.setEnabled(not busy)
         self.url_input.setEnabled(not busy)
         self.quality.setEnabled(not busy and not self.audio_only.isChecked())
         self.video_format.setEnabled(not busy and not self.audio_only.isChecked())

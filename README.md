@@ -9,6 +9,9 @@ Aplicação desktop de código aberto para gerir transferências de vídeo e áu
 - Interface desktop Qt em português.
 - Layout com rolagem vertical adaptável a ecrãs pequenos, evitando que os controlos fiquem cortados.
 - Transferência individual, playlists e URLs de canais reconhecidas pelo yt-dlp; URLs de coleções são detetadas automaticamente.
+- Seleção de itens antes de baixar uma playlist/canal, com botões para selecionar todos ou limpar a seleção.
+- Botão **Saltar item** para ignorar somente a música/vídeo atual e continuar com os itens seguintes; **Cancelar** continua reservado para parar toda a fila.
+- URLs individuais de TikTok, Instagram e outras fontes suportadas pelo yt-dlp. Perfis públicos podem ser tratados como coleções quando o extrator disponibilizar os itens.
 - Escolha de qualidade: melhor disponível, 1080p, 720p ou 480p.
 - Escolha do contêiner de vídeo: automático, MP4, MKV ou AVI.
 - Extração opcional de áudio MP3 e conversões usando FFmpeg/ffprobe preparados automaticamente no build Windows.
@@ -18,7 +21,7 @@ Aplicação desktop de código aberto para gerir transferências de vídeo e áu
 - Execução do trabalho numa thread separada para manter a interface responsiva.
 - Não tem contas, gestão de cookies, armazenamento de credenciais ou telemetria própria.
 
-O suporte real depende das capacidades e alterações dos sites suportados pela dependência `yt-dlp`. O programa não promete compatibilidade permanente com qualquer serviço.
+O suporte real depende das capacidades e alterações dos sites suportados pela dependência `yt-dlp`. TikTok e Instagram podem exigir sessão/cookies para conteúdo privado, restrito por idade ou sujeito a autenticação; esta versão não guarda credenciais nem contorna esses controlos. O programa não promete compatibilidade permanente com qualquer serviço.
 
 ## Agendamento
 
@@ -57,7 +60,7 @@ Ao executar pelo `run_windows.bat`, o script `prepare_ffmpeg_windows.bat` descar
 
 Na lista **Formato do vídeo**, MP4 seleciona preferencialmente vídeo H.264/AVC com áudio M4A/AAC para compatibilidade com o Windows. Se só houver outro codec MP4 com vídeo, o programa mantém a faixa de vídeo e recodifica o resultado para H.264/AAC, em vez de produzir um MP4 que toca apenas áudio. MKV converte/remuxa para Matroska; AVI usa vídeo Xvid e áudio MP3, quando os encoders FFmpeg necessários estão disponíveis. MKV/AVI e MP3 precisam de FFmpeg. A conversão MP4/AVI reencoda vídeo e áudio, pode demorar mais e pode reduzir a qualidade; MKV tenta preservar os streams quando possível.
 
-Para gerar o instalador Windows, instale apenas o Python 3.10+ de 64 bits e execute `create_installer_windows.bat` na máquina de compilação. Se o Inno Setup não estiver instalado, o script baixa automaticamente o compilador oficial mais recente para `%LOCALAPPDATA%\MediaLivre\tools\InnoSetup`, sem exigir `Activate.ps1` nem instalação manual. Em seguida prepara FFmpeg/ffprobe, compila com PyInstaller e usa `installer_windows.iss`. O resultado distribuível é um único `MediaLivre-Setup-0.7.0-win64.exe`, criado em `dist\installer` e copiado também para a raiz do projeto. O utilizador final executa somente esse EXE: ele já contém o runtime Python, PySide6, yt-dlp, mutagen, FFmpeg, ffprobe e o ícone, e cria o atalho do Ambiente de Trabalho por predefinição. Este build Windows não foi executado nem verificado neste ambiente Linux. Consulte [`INSTALAR_WINDOWS.md`](INSTALAR_WINDOWS.md).
+Para gerar o instalador Windows, instale apenas o Python 3.10+ de 64 bits e execute `create_installer_windows.bat` na máquina de compilação. Se o Inno Setup não estiver instalado, o script baixa automaticamente o compilador oficial mais recente para `%LOCALAPPDATA%\MediaLivre\tools\InnoSetup`, sem exigir `Activate.ps1` nem instalação manual. Em seguida prepara FFmpeg/ffprobe, compila com PyInstaller e usa `installer_windows.iss`. O resultado distribuível é um único `MediaLivre-Setup-0.8.0-win64.exe`, criado em `dist\installer` e copiado também para a raiz do projeto. O utilizador final executa somente esse EXE: ele já contém o runtime Python, PySide6, yt-dlp, mutagen, FFmpeg, ffprobe e o ícone, e cria o atalho do Ambiente de Trabalho por predefinição. Este build Windows não foi executado nem verificado neste ambiente Linux. Consulte [`INSTALAR_WINDOWS.md`](INSTALAR_WINDOWS.md).
 
 Se apenas precisar de compilar a aplicação, execute `build_windows.bat`; cria `dist\MediaLivre\MediaLivre.exe` com os ficheiros de runtime e a pasta `ffmpeg` adjacentes.
 
@@ -89,8 +92,9 @@ Instale FFmpeg através do gestor de pacotes do sistema. Em ambiente sem display
 1. Instale Python, as dependências do projeto e FFmpeg conforme acima.
 2. Inicie `python medialivre.py` (ou `run_windows.bat` no Windows).
 3. Cole uma ligação HTTP(S) a um vídeo que criou, possui ou tem autorização para transferir. Comece com **Melhor disponível** e **Automático**; depois teste MP4, MKV e AVI separadamente. A opção **Baixar miniatura/capa em JPG e incorporar quando possível** vem marcada: será criado um JPG junto da mídia e a capa será embutida no MP3/MP4/MKV quando o contêiner permitir.
-4. Para uma playlist ou URL de canal compatível com yt-dlp, a caixa **Transferir playlists e canais completos automaticamente** já vem marcada. O programa deteta URLs com `list=`, `/playlist`, `/channel/`, `/@`, `/c/` e `/user/`, força `noplaylist=False` e solicita os itens `1-`, em vez de limitar ao primeiro vídeo. Desmarque-a apenas quando quiser baixar um vídeo individual de uma URL que também contenha uma playlist.
-5. Confira o log e os ficheiros na pasta escolhida. Teste também **Cancelar**. A extração depende do suporte atual do yt-dlp ao serviço; não use com conteúdos sem autorização.
+4. Para uma playlist ou URL de canal compatível com yt-dlp, a caixa **Transferir playlists e canais completos** já vem marcada. Ao iniciar, o programa lê os itens e abre uma lista para desmarcar músicas ou vídeos. Também pode usar **Escolher itens** antes de iniciar, ou **Selecionar todos/Limpar seleção** dentro da janela. Desmarque a caixa se quiser tratar uma URL com lista como item individual; não é necessário fazer isso para links individuais de TikTok ou Instagram.
+5. Durante uma fila com vários itens, use **Saltar item** para ignorar somente o item atual e continuar com o seguinte. Use **Cancelar** para interromper toda a fila. Confira o log e os ficheiros na pasta escolhida. A extração depende do suporte atual do yt-dlp ao serviço; não use com conteúdos sem autorização.
+6. Para TikTok e Instagram, cole uma URL individual pública. Perfis/coleções públicos podem abrir a seleção de itens. Conteúdo privado, limitado por idade ou que exige sessão pode requerer cookies, funcionalidade que esta versão não guarda nem contorna.
 
 Também pode fazer um teste de integração isolado na sua própria máquina com um ficheiro de vídeo local seu: sirva-o apenas em `127.0.0.1` por HTTP e cole a URL local no MediaLivre. O teste exercita a transferência sem consultar um site externo. Um vídeo de teste pode ser gerado com FFmpeg:
 

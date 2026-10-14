@@ -3,6 +3,8 @@ from pathlib import Path
 
 from medialivre import (
     DownloadWorker,
+    SkipCurrentItem,
+    collection_items,
     container_options,
     is_collection_url,
     is_http_url,
@@ -41,9 +43,29 @@ class UrlValidationTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertTrue(is_collection_url(url))
         self.assertFalse(is_collection_url("https://www.youtube.com/watch?v=abc"))
-        self.assertTrue(playlist_enabled("https://www.youtube.com/playlist?list=PL123", False))
-        self.assertTrue(playlist_enabled("https://www.youtube.com/watch?v=abc", True))
+        self.assertFalse(playlist_enabled("https://www.youtube.com/playlist?list=PL123", False))
+        self.assertFalse(playlist_enabled("https://www.youtube.com/watch?v=abc", True))
+        self.assertTrue(playlist_enabled("https://www.youtube.com/playlist?list=PL123", True))
         self.assertFalse(playlist_enabled("https://www.youtube.com/watch?v=abc", False))
+
+    def test_detects_other_supported_sources_without_misclassifying_videos(self):
+        self.assertTrue(is_http_url("https://www.tiktok.com/@artist"))
+        self.assertTrue(is_collection_url("https://www.tiktok.com/@artist"))
+        self.assertFalse(is_collection_url("https://www.tiktok.com/@artist/video/123"))
+        self.assertTrue(is_collection_url("https://www.instagram.com/artist/"))
+        self.assertFalse(is_collection_url("https://www.instagram.com/reel/ABC123/"))
+        self.assertFalse(is_collection_url("https://www.instagram.com/p/ABC123/"))
+
+    def test_normalizes_flat_collection_entries(self):
+        items = collection_items({
+            "entries": [
+                {"playlist_index": 2, "id": "b", "title": "Segundo", "webpage_url": "https://example.com/b"},
+                None,
+                {"id": "c", "title": "Terceiro", "url": "https://example.com/c"},
+            ]
+        })
+        self.assertEqual([item["index"] for item in items], [2, 3])
+        self.assertEqual([item["title"] for item in items], ["Segundo", "Terceiro"])
 
 
 class FormatSelectionTests(unittest.TestCase):
@@ -143,6 +165,15 @@ class PlaylistProgressTests(unittest.TestCase):
         self.assertEqual([event[0] for event in item_events], [50, 20])
         self.assertIn("Primeiro", item_events[0][1])
         self.assertIn("Segundo", item_events[1][1])
+
+    def test_skip_request_targets_only_current_item(self):
+        worker = DownloadWorker("https://example.com/list", Path("."), "720p", False, True)
+        worker.total_items = 2
+        worker.current_position = 1
+        worker.skip_current_item()
+        with self.assertRaises(SkipCurrentItem):
+            worker._progress_hook({"status": "downloading", "info_dict": {"title": "Primeiro"}})
+        self.assertFalse(worker.skip_requested.is_set())
 
 
 if __name__ == "__main__":
