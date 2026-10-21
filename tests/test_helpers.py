@@ -5,6 +5,7 @@ import hashlib
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
+from yt_dlp.utils import DownloadError
 
 from medialivre import (
     DownloadWorker,
@@ -104,6 +105,30 @@ class UrlValidationTests(unittest.TestCase):
         self.assertTrue(should_try_direct_media("ERROR: Unsupported URL: https://example.test/player"))
         self.assertTrue(should_try_direct_media("No suitable extractor found"))
         self.assertFalse(should_try_direct_media("ERROR: HTTP Error 403: Forbidden"))
+
+    def test_unsupported_url_failure_is_emitted_once(self):
+        logs = []
+        failures = []
+        worker = DownloadWorker(
+            "https://boraflix.rest/filme/reza-a-lenda",
+            Path(tempfile.mkdtemp()),
+            "Melhor disponível",
+            audio_only=False,
+            allow_playlist=False,
+            container="Automático",
+        )
+        worker.log_line.connect(logs.append)
+        worker.failed.connect(failures.append)
+        with patch(
+            "medialivre.YoutubeDL.download",
+            side_effect=DownloadError(
+                "ERROR: Unsupported URL: https://boraflix.rest/filme/reza-a-lenda"
+            ),
+        ), patch("medialivre.probe_direct_media_url", return_value=None):
+            worker.run()
+        self.assertEqual(len(failures), 1)
+        self.assertEqual([line for line in logs if line.startswith("Erro:")], [])
+        self.assertEqual(failures[0].count("A página boraflix.rest"), 1)
 
 
 class UpdateCheckTests(unittest.TestCase):

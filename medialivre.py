@@ -51,7 +51,7 @@ from download_scheduler import ScheduleStore, ScheduledDownload, default_databas
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.14.0"
+APP_VERSION = "0.14.1"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 DIRECT_MEDIA_EXTENSIONS = {
@@ -487,6 +487,37 @@ def ffmpeg_location() -> Path | None:
     return None
 
 
+def ffprobe_binary() -> str | None:
+    location = ffmpeg_location()
+    if location:
+        for name in ("ffprobe.exe", "ffprobe"):
+            candidate = location / name
+            if candidate.is_file():
+                return str(candidate)
+    return shutil.which("ffprobe")
+
+
+def media_has_video_stream(path: Path) -> bool | None:
+    """Return whether a media file contains video, or None when ffprobe is unavailable."""
+    binary = ffprobe_binary()
+    if not binary or not path.is_file():
+        return None
+    try:
+        result = subprocess.run(
+            [
+                binary, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.returncode == 0 and "video" in result.stdout.lower().split()
+
+
 def quality_format(quality: str, audio_only: bool, container: str = "Automático") -> str:
     if audio_only:
         return "bestaudio/best"
@@ -778,6 +809,7 @@ class DownloadWorker(QObject):
         self.current_position = 1
         self.total_items = 1
         self.collection_title = collection_label(url)
+        self.last_output_path: Path | None = None
 
     def cancel(self) -> None:
         self.cancel_requested.set()
@@ -869,6 +901,7 @@ class DownloadWorker(QObject):
             "socket_timeout": 20,
             "retries": 3,
             "fragment_retries": 3,
+            "postprocessor_hooks": [self._postprocessor_hook],
         }
         location = ffmpeg_location()
         if location:
@@ -877,6 +910,29 @@ class DownloadWorker(QObject):
             self.log_line.emit("Aviso: FFmpeg/ffprobe não encontrado; conversão de formato pode falhar.")
         options.update(media_processing_options(self.download_thumbnail, self.audio_only, self.container))
         return options
+
+    def _postprocessor_hook(self, data: dict) -> None:
+        if data.get("status") != "finished":
+            return
+        info = data.get("info_dict") or {}
+        filepath = info.get("filepath") or info.get("_filename")
+        if filepath:
+            self.last_output_path = Path(str(filepath))
+
+    def _discard_video_output_without_video(self) -> bool:
+        if self.audio_only or self.container not in {"MP4", "MKV", "AVI"}:
+            return False
+        if not self.last_output_path:
+            return False
+        has_video = media_has_video_stream(self.last_output_path)
+        if has_video is not False:
+            return False
+        self.log_line.emit(
+            f"Ficheiro existente sem faixa de vídeo: {self.last_output_path.name}. "
+            "Será descarregado novamente."
+        )
+        self.last_output_path.unlink(missing_ok=True)
+        return True
 
     def _direct_progress(self, percent: int, title: str) -> None:
         percent = max(0, min(100, int(percent)))
@@ -1033,11 +1089,20 @@ class DownloadWorker(QObject):
                     self.current_position = position
                     self.last_percent = -1
                     self.last_item_key = None
+                    self.last_output_path = None
                     self.skip_requested.clear()
                     self.log_line.emit(f"A iniciar item {position}/{self.total_items}: {item['title']}")
                     self.item_started.emit(str(item["title"]))
                     try:
                         ydl.download([item["url"]])
+                        if self._discard_video_output_without_video():
+                            self.last_output_path = None
+                            ydl.download([item["url"]])
+                            if self._discard_video_output_without_video():
+                                raise DownloadError(
+                                    "A transferência terminou sem uma faixa de vídeo no ficheiro final. "
+                                    "Tente Formato do vídeo = Automático ou outra qualidade."
+                                )
                     except SkipCurrentItem:
                         self.log_line.emit(f"Item ignorado: {item['title']}")
                         self.progress.emit(
@@ -1068,7 +1133,8 @@ class DownloadWorker(QObject):
                         if direct_error:
                             message = f"{message}\nTentativa de URL direta: {direct_error}"
                         failures.append(f"{item['title']}: {message}")
-                        self.log_line.emit(f"Erro no item {position}/{self.total_items}: {message}")
+                        if self.total_items > 1:
+                            self.log_line.emit(f"Erro no item {position}/{self.total_items}: {message}")
                         if self.total_items == 1:
                             raise DownloadError(message)
                         continue
@@ -1100,6 +1166,8 @@ class DownloadWorker(QObject):
         self.log_line.emit(f"Aviso: {message}")
 
     def error(self, message: str) -> None:
+        if should_try_direct_media(message):
+            return
         self.log_line.emit(f"Erro: {message}")
 
 

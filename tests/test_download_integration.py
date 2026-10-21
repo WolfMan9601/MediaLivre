@@ -180,6 +180,56 @@ class LocalDownloadIntegrationTests(unittest.TestCase):
         self.assertTrue(result["completed"])
         self.assertTrue((destination / "exemplo.mp4").is_file())
 
+    def test_replaces_existing_mp4_that_has_audio_but_no_video(self):
+        destination = self.root / "stale-mp4"
+        first = DownloadWorker(
+            self.url,
+            destination,
+            "Melhor disponível",
+            audio_only=False,
+            allow_playlist=False,
+            container="MP4",
+        )
+        first_result = {"completed": [], "failed": []}
+        first.completed.connect(lambda path: first_result["completed"].append(path))
+        first.failed.connect(lambda error: first_result["failed"].append(error))
+        first.run()
+        self.assertFalse(first_result["failed"], first_result["failed"])
+        output = next(destination.glob("*.mp4"))
+
+        audio_only = self.root / "audio-only.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=330:duration=1",
+                "-vn", "-c:a", "aac", str(audio_only),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        shutil.copyfile(audio_only, output)
+
+        second = DownloadWorker(
+            self.url,
+            destination,
+            "Melhor disponível",
+            audio_only=False,
+            allow_playlist=False,
+            container="MP4",
+        )
+        second_result = {"completed": [], "failed": []}
+        second.completed.connect(lambda path: second_result["completed"].append(path))
+        second.failed.connect(lambda error: second_result["failed"].append(error))
+        second.run()
+        self.assertFalse(second_result["failed"], second_result["failed"])
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(output)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("video", probe.stdout.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
