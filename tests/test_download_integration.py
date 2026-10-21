@@ -6,12 +6,14 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from yt_dlp import YoutubeDL
 from yt_dlp.postprocessor.embedthumbnail import EmbedThumbnailPP
 from yt_dlp.postprocessor.ffmpeg import FFmpegThumbnailsConvertorPP
+from yt_dlp.utils import DownloadError
 
-from medialivre import DownloadWorker, ffmpeg_location, media_processing_options
+from medialivre import DownloadWorker, ffmpeg_location, media_processing_options, probe_direct_media_url
 
 
 TOOLS_AVAILABLE = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -45,6 +47,12 @@ class LocalDownloadIntegrationTests(unittest.TestCase):
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.server_thread.start()
         cls.url = f"http://127.0.0.1:{cls.server.server_port}/exemplo.mp4"
+        cls.page = cls.root / "player.html"
+        cls.page.write_text(
+            '<!doctype html><video controls><source src="exemplo.mp4" type="video/mp4"></video>',
+            encoding="utf-8",
+        )
+        cls.page_url = f"http://127.0.0.1:{cls.server.server_port}/player.html"
 
     @classmethod
     def tearDownClass(cls):
@@ -144,6 +152,33 @@ class LocalDownloadIntegrationTests(unittest.TestCase):
             text=True,
         )
         self.assertIn("video", probe.stdout.lower())
+
+    def test_generic_html_page_falls_back_to_embedded_direct_video(self):
+        info = probe_direct_media_url(self.page_url)
+        self.assertIsNotNone(info)
+        self.assertTrue(info["url"].endswith("/exemplo.mp4"))
+        destination = self.root / "generic-page"
+        worker = DownloadWorker(
+            self.page_url,
+            destination,
+            "Melhor disponível",
+            audio_only=False,
+            allow_playlist=False,
+            container="Automático",
+        )
+        result = {"completed": [], "failed": [], "cancelled": []}
+        worker.completed.connect(lambda path: result["completed"].append(path))
+        worker.failed.connect(lambda error: result["failed"].append(error))
+        worker.cancelled.connect(lambda: result["cancelled"].append(True))
+        with patch(
+            "medialivre.YoutubeDL.download",
+            side_effect=DownloadError(f"ERROR: Unsupported URL: {self.page_url}"),
+        ):
+            worker.run()
+        self.assertFalse(result["failed"], result["failed"])
+        self.assertFalse(result["cancelled"])
+        self.assertTrue(result["completed"])
+        self.assertTrue((destination / "exemplo.mp4").is_file())
 
 
 if __name__ == "__main__":

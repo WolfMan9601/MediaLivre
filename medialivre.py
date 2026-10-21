@@ -4,14 +4,19 @@ import os
 import json
 import re
 import hashlib
+import mimetypes
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
+import time
+from html.parser import HTMLParser
 from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QUrl, QDateTime, QTimer, QLockFile, QSettings, QProcess
 from PySide6.QtGui import QDesktopServices, QFont, QIcon
@@ -46,8 +51,95 @@ from download_scheduler import ScheduleStore, ScheduledDownload, default_databas
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.13.1"
+APP_VERSION = "0.14.0"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
+
+DIRECT_MEDIA_EXTENSIONS = {
+    ".3gp", ".aac", ".avi", ".flac", ".m4a", ".m4v", ".mkv", ".mov",
+    ".mp3", ".mp4", ".mpeg", ".mpg", ".oga", ".ogg", ".ogv", ".opus",
+    ".wav", ".webm", ".wmv",
+}
+
+
+class _EmbeddedMediaParser(HTMLParser):
+    """Read only standard media element URLs from a public HTML page."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.sources: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() not in {"audio", "source", "video"}:
+            return
+        attributes = {key.lower(): value for key, value in attrs}
+        source = attributes.get("src")
+        if source:
+            self.sources.append(source.strip())
+
+
+def _filename_from_content_disposition(value: str) -> str:
+    match = re.search(r"filename\*=[^']*''([^;]+)|filename=\"?([^\";]+)", value or "", re.I)
+    if not match:
+        return ""
+    return unquote((match.group(1) or match.group(2)).strip())
+
+
+def _media_extension(url: str, content_type: str = "", filename: str = "") -> str:
+    for candidate in (filename, urlparse(url).path):
+        suffix = Path(unquote(candidate)).suffix.lower()
+        if suffix in DIRECT_MEDIA_EXTENSIONS:
+            return suffix
+    guessed = mimetypes.guess_extension(content_type.split(";", 1)[0].strip().lower())
+    return guessed.lower() if guessed and guessed.lower() in DIRECT_MEDIA_EXTENSIONS else ""
+
+
+def probe_direct_media_url(value: str, _visited: tuple[str, ...] = ()) -> dict | None:
+    """Probe a public URL and return a direct media target or a standard HTML media source."""
+    if not is_http_url(value) or value in _visited:
+        return None
+    request = Request(
+        value,
+        headers={
+            "Accept": "video/*, audio/*, application/octet-stream, text/html;q=0.8",
+            "Range": "bytes=0-65535",
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        },
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            final_url = str(response.geturl() or value)
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            content_disposition = str(response.headers.get("Content-Disposition") or "")
+            filename = _filename_from_content_disposition(content_disposition)
+            extension = _media_extension(final_url, content_type, filename)
+            media_type = content_type.split(";", 1)[0].strip()
+            if media_type.startswith(("audio/", "video/")) or (
+                media_type == "application/octet-stream" and extension
+            ) or extension and media_type in {"", "application/octet-stream"}:
+                return {
+                    "url": final_url,
+                    "filename": filename or Path(unquote(urlparse(final_url).path)).name,
+                    "extension": extension,
+                    "content_type": media_type,
+                }
+            if not media_type.startswith("text/html"):
+                return None
+            html = response.read(1024 * 1024).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    parser = _EmbeddedMediaParser()
+    try:
+        parser.feed(html)
+    except Exception:
+        return None
+    visited = (*_visited, value, final_url)
+    for source in parser.sources:
+        candidate = urljoin(final_url, source)
+        result = probe_direct_media_url(candidate, visited)
+        if result:
+            return result
+    return None
 
 
 def resource_path(*parts: str) -> Path:
@@ -107,7 +199,8 @@ def user_facing_download_error(message: str, url: str) -> str:
         return (
             f"A página {host} não tem um extrator específico no yt-dlp instalado. "
             "Isto não é uma falha de MP4 ou FFmpeg. Para conteúdo que criou, possui ou está autorizado "
-            "a transferir, use o download oficial do serviço ou cole uma URL direta HTTP(S) do ficheiro/stream. "
+            "a transferir, use o download oficial do serviço, cole uma URL direta HTTP(S) do ficheiro/stream "
+            "ou uma página pública que contenha uma tag <video>, <audio> ou <source> direta. "
             "O MediaLivre não contorna DRM, paywalls, autenticação ou controlos de acesso."
         )
     if "requested format is not available" in lowered:
@@ -121,6 +214,11 @@ def user_facing_download_error(message: str, url: str) -> str:
             "autorização; o MediaLivre não tenta contornar bloqueios ou autenticação."
         )
     return clean
+
+
+def should_try_direct_media(message: str) -> bool:
+    lowered = str(message or "").lower()
+    return "unsupported url" in lowered or "no suitable extractor" in lowered
 
 
 def collection_label(value: str) -> str:
@@ -638,6 +736,20 @@ class SkipCurrentItem(Exception):
     """Internal control flow used to skip the active playlist entry."""
 
 
+class DirectMediaCancelled(Exception):
+    """Internal control flow for cancelling a direct HTTP media transfer."""
+
+
+class DirectMediaUnavailable(Exception):
+    """The URL did not resolve to a standard public direct media resource."""
+
+
+def _safe_direct_stem(value: str) -> str:
+    stem = Path(unquote(value or "")).stem or "media"
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", stem).strip(" .")
+    return (stem[:140] or "media")
+
+
 class DownloadWorker(QObject):
     progress = Signal(int, str)
     item_progress = Signal(int, str)
@@ -766,6 +878,134 @@ class DownloadWorker(QObject):
         options.update(media_processing_options(self.download_thumbnail, self.audio_only, self.container))
         return options
 
+    def _direct_progress(self, percent: int, title: str) -> None:
+        percent = max(0, min(100, int(percent)))
+        if self.total_items > 1:
+            overall = int(((self.current_position - 1 + percent / 100) / self.total_items) * 100)
+            batch_label = f"{self.collection_title} · item {self.current_position} de {self.total_items}"
+            item_label = f"Item {self.current_position}/{self.total_items} · {title}"
+        else:
+            overall = percent
+            batch_label = "URL direta"
+            item_label = title
+        self.progress.emit(overall, batch_label)
+        self.item_progress.emit(percent, item_label)
+
+    def _direct_ffmpeg_binary(self) -> str | None:
+        location = ffmpeg_location()
+        if location:
+            for name in ("ffmpeg.exe", "ffmpeg"):
+                candidate = location / name
+                if candidate.is_file():
+                    return str(candidate)
+        return shutil.which("ffmpeg")
+
+    def _convert_direct_media(self, source: Path, target: Path) -> None:
+        binary = self._direct_ffmpeg_binary()
+        if not binary:
+            raise DirectMediaUnavailable(
+                "FFmpeg não foi encontrado para converter esta URL direta. "
+                "Instale FFmpeg ou use Formato do vídeo = Automático."
+            )
+        if self.audio_only:
+            command = [binary, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-vn", "-codec:a", "libmp3lame", "-b:a", "192k", str(target)]
+        elif self.container == "MP4":
+            command = [binary, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(target)]
+        elif self.container == "MKV":
+            command = [binary, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-map", "0", "-c", "copy", str(target)]
+        elif self.container == "AVI":
+            command = [binary, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source), "-c:v", "libxvid", "-c:a", "libmp3lame", "-b:a", "192k", str(target)]
+        else:
+            source.replace(target)
+            return
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        while process.poll() is None:
+            if self.cancel_requested.is_set():
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise DirectMediaCancelled()
+            time.sleep(0.1)
+        error = (process.stderr.read() if process.stderr else "").strip()
+        if process.returncode:
+            raise DirectMediaUnavailable(error or "O FFmpeg não conseguiu converter a URL direta.")
+
+    def _download_direct_media(self, url: str, title: str) -> Path:
+        info = probe_direct_media_url(url)
+        if not info:
+            raise DirectMediaUnavailable(
+                "A URL não devolveu um ficheiro de áudio/vídeo público nem uma tag HTML "
+                "<video>, <audio> ou <source> utilizável."
+            )
+        source_extension = info.get("extension") or ""
+        if not source_extension:
+            raise DirectMediaUnavailable("O tipo do ficheiro direto não pôde ser identificado com segurança.")
+        filename = str(info.get("filename") or "")
+        stem = _safe_direct_stem(filename or title or "media")
+        target_extension = ".mp3" if self.audio_only else {
+            "MP4": ".mp4",
+            "MKV": ".mkv",
+            "AVI": ".avi",
+        }.get(self.container, source_extension)
+        target = self.destination / f"{stem}{target_extension}"
+        if target.exists():
+            self.log_line.emit(f"Ficheiro já existe; item ignorado: {target.name}")
+            self._direct_progress(100, title or target.name)
+            return target
+        source_handle = tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{stem}.",
+            suffix=f".source{source_extension}",
+            dir=self.destination,
+            delete=False,
+        )
+        source = Path(source_handle.name)
+        source_handle.close()
+        converted = target.with_name(f".{target.name}.part")
+        try:
+            request = Request(
+                str(info["url"]),
+                headers={"Accept": "*/*", "User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+            )
+            self.log_line.emit(f"URL direta detetada: {info['url']}")
+            with urlopen(request, timeout=30) as response, source.open("wb") as output:
+                try:
+                    total = int(response.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    total = 0
+                downloaded = 0
+                while True:
+                    if self.cancel_requested.is_set():
+                        raise DirectMediaCancelled()
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        self._direct_progress(int(downloaded * 100 / total), title or target.name)
+            if self.cancel_requested.is_set():
+                raise DirectMediaCancelled()
+            if self.audio_only or self.container in {"MP4", "MKV", "AVI"}:
+                converted.unlink(missing_ok=True)
+                self._convert_direct_media(source, converted)
+                converted.replace(target)
+            else:
+                source.replace(target)
+            self._direct_progress(100, title or target.name)
+            return target
+        finally:
+            source.unlink(missing_ok=True)
+            converted.unlink(missing_ok=True)
+
     @Slot()
     def run(self) -> None:
         try:
@@ -811,10 +1051,26 @@ class DownloadWorker(QObject):
                             self.cancelled.emit()
                             return
                         message = user_facing_download_error(str(exc), item["url"])
+                        direct_error = None
+                        if should_try_direct_media(str(exc)):
+                            try:
+                                self._download_direct_media(item["url"], str(item["title"]))
+                                completed_items += 1
+                                self.log_line.emit(
+                                    f"Transferência direta concluída: {item['title']}"
+                                )
+                                continue
+                            except DirectMediaCancelled:
+                                self.cancelled.emit()
+                                return
+                            except DirectMediaUnavailable as direct_exc:
+                                direct_error = str(direct_exc).strip()
+                        if direct_error:
+                            message = f"{message}\nTentativa de URL direta: {direct_error}"
                         failures.append(f"{item['title']}: {message}")
                         self.log_line.emit(f"Erro no item {position}/{self.total_items}: {message}")
                         if self.total_items == 1:
-                            raise
+                            raise DownloadError(message)
                         continue
                     completed_items += 1
             if self.cancel_requested.is_set():

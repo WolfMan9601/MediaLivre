@@ -21,6 +21,7 @@ from medialivre import (
     playlist_enabled,
     progress_details,
     quality_format,
+    should_try_direct_media,
     start_installer_process,
     user_facing_download_error,
     version_tuple,
@@ -98,6 +99,11 @@ class UrlValidationTests(unittest.TestCase):
         self.assertIn("URL direta HTTP(S)", message)
         self.assertIn("não contorna DRM", message)
         self.assertNotIn("FFmpeg", message.split("Isto não é", 1)[0])
+
+    def test_direct_media_fallback_is_limited_to_unsupported_extractor_errors(self):
+        self.assertTrue(should_try_direct_media("ERROR: Unsupported URL: https://example.test/player"))
+        self.assertTrue(should_try_direct_media("No suitable extractor found"))
+        self.assertFalse(should_try_direct_media("ERROR: HTTP Error 403: Forbidden"))
 
 
 class UpdateCheckTests(unittest.TestCase):
