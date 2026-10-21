@@ -1,5 +1,5 @@
 #define AppName "MediaLivre"
-#define AppVersion "0.13.0"
+#define AppVersion "0.13.1"
 #define AppPublisher "MediaLivre contributors"
 #define AppExeName "MediaLivre.exe"
 
@@ -19,6 +19,8 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64
+CloseApplications=yes
+RestartApplications=yes
 UninstallDisplayIcon={app}\{#AppExeName}
 SetupIconFile=assets\medialivre.ico
 SetupLogging=yes
@@ -37,4 +39,4 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\medialivre.ico"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#AppExeName}"; Description: "Iniciar o {#AppName}"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\{#AppExeName}"; Description: "Iniciar o {#AppName}"; Flags: postinstall nowait

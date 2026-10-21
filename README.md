@@ -21,7 +21,7 @@ Aplicação desktop de código aberto para gerir transferências de vídeo e áu
 - Agendamentos únicos persistidos em SQLite, com estado, opções e cancelamento de tarefas pendentes.
 - Execução do trabalho numa thread separada para manter a interface responsiva.
 - Não tem contas próprias nem telemetria, nem recolhe cookies ou credenciais do utilizador.
-- Consulta diariamente as GitHub Releases de `WolfMan9601/MediaLivre` em segundo plano e marca o botão **Atualizações** quando existe uma versão mais recente. A pessoa abre o botão, escolhe uma Release com instalador e checksum, e a app descarrega, valida o SHA-256, inicia o instalador e fecha-se para concluir a atualização sem exigir a abertura manual de um EXE.
+- Consulta diariamente as GitHub Releases de `WolfMan9601/MediaLivre` em segundo plano e marca o botão **Atualizações** quando existe uma versão mais recente. A pessoa abre o botão, escolhe uma Release com instalador e checksum, e a app descarrega, valida o SHA-256, inicia o instalador silencioso e fecha-se; o próprio setup substitui os ficheiros e relança o MediaLivre automaticamente.
 
 O suporte real depende das capacidades e alterações dos sites suportados pela dependência `yt-dlp`. Se uma página só for reconhecida pelo extrator genérico, o MediaLivre informa que não existe um extrator específico em vez de fingir que o problema é de MP4/FFmpeg. Nessa situação, use o download oficial ou uma URL direta do ficheiro/stream que tenha autorização para transferir. Conteúdo privado, expirado, limitado por idade ou sujeito a autenticação pode não estar disponível. O programa não promete compatibilidade permanente com qualquer serviço.
 
@@ -62,15 +62,15 @@ Ao executar pelo `run_windows.bat`, o script `prepare_ffmpeg_windows.bat` descar
 
 Na lista **Formato do vídeo**, MP4 seleciona preferencialmente vídeo H.264/AVC com áudio M4A/AAC para compatibilidade com o Windows. Se só houver outro codec MP4 com vídeo, o programa mantém a faixa de vídeo e recodifica o resultado para H.264/AAC, em vez de produzir um MP4 que toca apenas áudio. MKV converte/remuxa para Matroska; AVI usa vídeo Xvid e áudio MP3, quando os encoders FFmpeg necessários estão disponíveis. MKV/AVI e MP3 precisam de FFmpeg. A conversão MP4/AVI reencoda vídeo e áudio, pode demorar mais e pode reduzir a qualidade; MKV tenta preservar os streams quando possível.
 
-Para gerar o instalador Windows, instale apenas o Python 3.10+ de 64 bits e execute `create_installer_windows.bat` na máquina de compilação. Se o Inno Setup não estiver instalado, o script baixa automaticamente o compilador oficial mais recente para `%LOCALAPPDATA%\MediaLivre\tools\InnoSetup`, sem exigir `Activate.ps1` nem instalação manual. Em seguida prepara FFmpeg/ffprobe, compila com PyInstaller e usa `installer_windows.iss`. O resultado distribuível desta versão é um único `MediaLivre-Setup-0.13.0-win64.exe`, criado em `dist\installer` e copiado também para a raiz do projeto. O utilizador final executa somente esse EXE: ele já contém o runtime Python, PySide6, yt-dlp, mutagen, FFmpeg, ffprobe e o ícone, e cria o atalho do Ambiente de Trabalho por predefinição. Este build Windows não foi executado nem verificado neste ambiente Linux. Consulte [`INSTALAR_WINDOWS.md`](INSTALAR_WINDOWS.md).
+Para gerar o instalador Windows, instale apenas o Python 3.10+ de 64 bits e execute `create_installer_windows.bat` na máquina de compilação. Se o Inno Setup não estiver instalado, o script baixa automaticamente o compilador oficial mais recente para `%LOCALAPPDATA%\MediaLivre\tools\InnoSetup`, sem exigir `Activate.ps1` nem instalação manual. Em seguida prepara FFmpeg/ffprobe, compila com PyInstaller e usa `installer_windows.iss`. O resultado distribuível desta versão é um único `MediaLivre-Setup-0.13.1-win64.exe`, criado em `dist\installer` e copiado também para a raiz do projeto. O utilizador final executa somente esse EXE: ele já contém o runtime Python, PySide6, yt-dlp, mutagen, FFmpeg, ffprobe e o ícone, e cria o atalho do Ambiente de Trabalho por predefinição. Este build Windows não foi executado nem verificado neste ambiente Linux. Consulte [`INSTALAR_WINDOWS.md`](INSTALAR_WINDOWS.md).
 
 ### Atualizações e GitHub Actions
 
 O ficheiro `.github/workflows/windows-release.yml` compila automaticamente o instalador num runner Windows sempre que uma tag `vMAJOR.MINOR.PATCH` é enviada para o GitHub. O workflow atualiza a versão, prepara Python e FFmpeg, executa o build, gera o SHA-256 e publica `MediaLivre-Setup-{versão}-win64.exe` como asset da GitHub Release. Para lançar uma nova versão:
 
 ```bash
-git tag v0.13.0
-git push origin v0.13.0
+git tag v0.13.1
+git push origin v0.13.1
 ```
 
 O aplicativo consulta `https://api.github.com/repos/WolfMan9601/MediaLivre/releases?per_page=50` no máximo uma vez por dia. O botão **Atualizações** permite consultar manualmente a lista e escolher uma versão específica. A atualização automática só é disponibilizada quando a Release contém o instalador EXE e o respetivo checksum SHA-256: o MediaLivre descarrega-o em segundo plano, valida-o, inicia o setup com os parâmetros de atualização e fecha a aplicação; não é necessário localizar ou abrir o EXE manualmente. Releases incompletas abrem apenas a página oficial. Sem Internet ou sem uma Release disponível, o MediaLivre continua a funcionar normalmente.

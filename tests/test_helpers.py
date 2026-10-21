@@ -21,6 +21,7 @@ from medialivre import (
     playlist_enabled,
     progress_details,
     quality_format,
+    start_installer_process,
     user_facing_download_error,
     version_tuple,
 )
@@ -179,6 +180,17 @@ class UpdateCheckTests(unittest.TestCase):
             worker.run()
             self.assertIn("checksum SHA-256", events[0])
             self.assertFalse(target.exists())
+
+    def test_start_installer_process_unwraps_qprocess_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "MediaLivre-Setup-test.exe"
+            target.write_bytes(b"installer")
+            with patch("medialivre.QProcess.startDetached", return_value=(False, -1)) as start:
+                self.assertFalse(start_installer_process(str(target)))
+            with patch("medialivre.QProcess.startDetached", return_value=(True, 1234)) as start:
+                self.assertTrue(start_installer_process(str(target)))
+                self.assertEqual(start.call_args.args[0], str(target))
+                self.assertIn("/VERYSILENT", start.call_args.args[1])
 
 
 class FormatSelectionTests(unittest.TestCase):

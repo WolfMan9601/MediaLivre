@@ -38,13 +38,13 @@ echo A compilar o instalador com: %ISCC_EXE%
 if errorlevel 1 exit /b 1
 
 echo.
-set "SETUP_EXE=dist\installer\MediaLivre-Setup-0.13.0-win64.exe"
+set "SETUP_EXE=dist\installer\MediaLivre-Setup-0.13.1-win64.exe"
 if not exist "%SETUP_EXE%" (
   echo O Inno Setup terminou, mas o ficheiro EXE final nao foi encontrado.
   exit /b 1
 )
-copy /Y "%SETUP_EXE%" "MediaLivre-Setup-0.13.0-win64.exe" >nul
+copy /Y "%SETUP_EXE%" "MediaLivre-Setup-0.13.1-win64.exe" >nul
 if errorlevel 1 exit /b 1
 echo Instalador EXE criado em:
 echo   %SETUP_EXE%
-echo   MediaLivre-Setup-0.13.0-win64.exe
+echo   MediaLivre-Setup-0.13.1-win64.exe

@@ -46,7 +46,7 @@ from download_scheduler import ScheduleStore, ScheduledDownload, default_databas
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.13.0"
+APP_VERSION = "0.13.1"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 
@@ -209,6 +209,26 @@ def extract_sha256(text: str) -> str | None:
     """Extract the first standard SHA-256 digest from a checksum asset."""
     match = re.search(r"\b([0-9a-fA-F]{64})\b", text or "")
     return match.group(1).lower() if match else None
+
+
+def installer_launch_arguments() -> list[str]:
+    """Return Inno Setup arguments for a silent update that relaunches the app."""
+    return ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/CLOSEAPPLICATIONS", "/NORESTART"]
+
+
+def start_installer_process(path: str) -> bool:
+    """Start the downloaded installer and correctly unwrap PySide6's (ok, pid) result."""
+    installer = Path(path)
+    if not installer.is_file():
+        return False
+    result = QProcess.startDetached(
+        str(installer),
+        installer_launch_arguments(),
+        str(installer.parent),
+    )
+    if isinstance(result, tuple):
+        return bool(result[0])
+    return bool(result)
 
 
 class UpdateCheckWorker(QObject):
@@ -1273,17 +1293,15 @@ class MainWindow(QMainWindow):
             self.install_update_progress.setLabelText("A iniciar o instalador; o MediaLivre será fechado…")
             self.install_update_progress.setCancelButton(None)
             self.install_update_progress.setValue(100)
-        started = QProcess.startDetached(
-            path,
-            ["/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
-        )
+        self._append_log(f"Instalador validado; a iniciar atualização: {path}")
+        started = start_installer_process(path)
         if not started:
             if self.install_update_progress:
                 self.install_update_progress.close()
             QMessageBox.warning(
                 self,
                 "Atualização não iniciada",
-                "O instalador foi descarregado, mas o Windows não conseguiu iniciá-lo automaticamente. "
+                "O instalador foi descarregado e validado, mas o Windows não conseguiu iniciá-lo automaticamente. "
                 f"Pode executá-lo manualmente em:\n{path}",
             )
             return
