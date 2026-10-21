@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -39,12 +40,13 @@ from PySide6.QtWidgets import (
     QScrollArea,
 )
 from yt_dlp import YoutubeDL
+from yt_dlp.extractor import gen_extractors
 from yt_dlp.utils import DownloadError
 from download_scheduler import ScheduleStore, ScheduledDownload, default_database_path
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.12.1"
+APP_VERSION = "0.13.0"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 
@@ -66,6 +68,59 @@ def is_http_url(value: str) -> bool:
         )
     except ValueError:
         return False
+
+
+@lru_cache(maxsize=256)
+def matching_extractors(value: str) -> tuple[str, ...]:
+    """Return specific yt-dlp extractors that recognize a URL, excluding generic."""
+    if not is_http_url(value):
+        return ()
+    matches: list[str] = []
+    for extractor in gen_extractors():
+        name = str(getattr(extractor, "IE_NAME", "") or "")
+        if not name or name == "generic":
+            continue
+        try:
+            if extractor.suitable(value):
+                matches.append(name)
+        except Exception:
+            continue
+    return tuple(dict.fromkeys(matches))
+
+
+def user_facing_download_error(message: str, url: str) -> str:
+    """Turn common yt-dlp failures into actionable, non-misleading guidance."""
+    clean = str(message or "").strip() or "Falha desconhecida na transferência."
+    lowered = clean.lower()
+    if "unsupported url" in lowered or "no suitable extractor" in lowered:
+        try:
+            host = (urlparse(url).hostname or url).lower()
+        except ValueError:
+            host = url
+        extractors = matching_extractors(url)
+        if extractors:
+            known = ", ".join(extractors[:3])
+            return (
+                f"A página {host} foi reconhecida por {known}, mas o conteúdo não pôde ser extraído. "
+                "Tente a opção Automático e confirme que tem autorização para transferir o conteúdo."
+            )
+        return (
+            f"A página {host} não tem um extrator específico no yt-dlp instalado. "
+            "Isto não é uma falha de MP4 ou FFmpeg. Para conteúdo que criou, possui ou está autorizado "
+            "a transferir, use o download oficial do serviço ou cole uma URL direta HTTP(S) do ficheiro/stream. "
+            "O MediaLivre não contorna DRM, paywalls, autenticação ou controlos de acesso."
+        )
+    if "requested format is not available" in lowered:
+        return (
+            "A fonte não disponibilizou o formato solicitado. Tente Formato do vídeo = Automático e "
+            "Qualidade = Melhor disponível."
+        )
+    if "http error 403" in lowered or "forbidden" in lowered:
+        return (
+            "A origem recusou a transferência (HTTP 403). Verifique se o conteúdo é público e se tem "
+            "autorização; o MediaLivre não tenta contornar bloqueios ou autenticação."
+        )
+    return clean
 
 
 def collection_label(value: str) -> str:
@@ -447,7 +502,7 @@ class CollectionInspectWorker(QObject):
             title = str((info or {}).get("title") or (info or {}).get("playlist_title") or collection_label(self.url))
             self.found.emit(items, title)
         except Exception as exc:
-            self.failed.emit(str(exc).strip() or exc.__class__.__name__)
+            self.failed.emit(user_facing_download_error(str(exc), self.url))
 
 
 class CollectionSelectionDialog(QDialog):
@@ -735,7 +790,7 @@ class DownloadWorker(QObject):
                         if self.cancel_requested.is_set():
                             self.cancelled.emit()
                             return
-                        message = str(exc).strip() or exc.__class__.__name__
+                        message = user_facing_download_error(str(exc), item["url"])
                         failures.append(f"{item['title']}: {message}")
                         self.log_line.emit(f"Erro no item {position}/{self.total_items}: {message}")
                         if self.total_items == 1:
@@ -753,7 +808,7 @@ class DownloadWorker(QObject):
             if self.cancel_requested.is_set():
                 self.cancelled.emit()
             else:
-                message = str(exc).strip() or exc.__class__.__name__
+                message = user_facing_download_error(str(exc), self.url)
                 self.failed.emit(message)
 
     # yt-dlp logger protocol

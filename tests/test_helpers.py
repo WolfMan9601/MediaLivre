@@ -17,9 +17,11 @@ from medialivre import (
     is_collection_url,
     is_http_url,
     media_processing_options,
+    matching_extractors,
     playlist_enabled,
     progress_details,
     quality_format,
+    user_facing_download_error,
     version_tuple,
 )
 
@@ -80,6 +82,21 @@ class UrlValidationTests(unittest.TestCase):
         })
         self.assertEqual([item["index"] for item in items], [2, 3])
         self.assertEqual([item["title"] for item in items], ["Segundo", "Terceiro"])
+
+    def test_reports_specific_extractor_for_supported_source(self):
+        names = matching_extractors("https://www.youtube.com/watch?v=abc123")
+        self.assertTrue(any(name.lower().startswith("youtube") for name in names))
+
+    def test_explains_generic_unsupported_page_without_promising_scraping(self):
+        message = user_facing_download_error(
+            "ERROR: Unsupported URL: https://boraflix.rest/filme/reza-a-lenda",
+            "https://boraflix.rest/filme/reza-a-lenda",
+        )
+        self.assertIn("boraflix.rest", message)
+        self.assertIn("não tem um extrator específico", message)
+        self.assertIn("URL direta HTTP(S)", message)
+        self.assertIn("não contorna DRM", message)
+        self.assertNotIn("FFmpeg", message.split("Isto não é", 1)[0])
 
 
 class UpdateCheckTests(unittest.TestCase):
