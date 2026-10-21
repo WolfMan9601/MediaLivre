@@ -51,7 +51,7 @@ from download_scheduler import ScheduleStore, ScheduledDownload, default_databas
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.14.1"
+APP_VERSION = "0.14.2"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 DIRECT_MEDIA_EXTENSIONS = {
@@ -934,6 +934,41 @@ class DownloadWorker(QObject):
         self.last_output_path.unlink(missing_ok=True)
         return True
 
+    def _item_output_tokens(self, item: dict) -> tuple[str, ...]:
+        """Return conservative ID tokens used by yt-dlp's output template."""
+        tokens: list[str] = []
+        item_id = str(item.get("id") or "")
+        if item_id and item_id != "single":
+            tokens.append(item_id)
+        try:
+            parsed = urlparse(str(item.get("url") or ""))
+            values = [parsed.path, parsed.query]
+            values.extend(parsed.query.split("&"))
+            for value in values:
+                for token in re.findall(r"(?<![A-Za-z0-9])[A-Za-z0-9_-]{5,}(?![A-Za-z0-9])", value):
+                    if token not in {"video", "watch", "reel", "reels", "facebook"}:
+                        tokens.append(token)
+        except ValueError:
+            pass
+        return tuple(dict.fromkeys(tokens))
+
+    def _existing_invalid_video(self, item: dict) -> Path | None:
+        """Find an existing output with the item ID that ffprobe says has no video."""
+        if self.audio_only:
+            return None
+        extensions = {".mp4", ".mkv", ".avi"}
+        candidates: list[Path] = []
+        for token in self._item_output_tokens(item):
+            candidates.extend(self.destination.glob(f"* [{token}].*"))
+        if self.last_output_path:
+            candidates.append(self.last_output_path)
+        for candidate in dict.fromkeys(candidates):
+            if candidate.suffix.lower() not in extensions:
+                continue
+            if media_has_video_stream(candidate) is False:
+                return candidate
+        return None
+
     def _direct_progress(self, percent: int, title: str) -> None:
         percent = max(0, min(100, int(percent)))
         if self.total_items > 1:
@@ -1091,6 +1126,14 @@ class DownloadWorker(QObject):
                     self.last_item_key = None
                     self.last_output_path = None
                     self.skip_requested.clear()
+                    stale_output = self._existing_invalid_video(item)
+                    if stale_output:
+                        self.log_line.emit(
+                            f"Ficheiro existente sem vídeo detetado: {stale_output.name}. "
+                            "A removê-lo para refazer a combinação de vídeo e áudio."
+                        )
+                        stale_output.unlink(missing_ok=True)
+                        self.last_output_path = None
                     self.log_line.emit(f"A iniciar item {position}/{self.total_items}: {item['title']}")
                     self.item_started.emit(str(item["title"]))
                     try:

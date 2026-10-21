@@ -130,6 +130,21 @@ class UrlValidationTests(unittest.TestCase):
         self.assertEqual([line for line in logs if line.startswith("Erro:")], [])
         self.assertEqual(failures[0].count("A página boraflix.rest"), 1)
 
+    def test_facebook_reel_id_is_used_to_find_existing_output(self):
+        worker = DownloadWorker(
+            "https://www.facebook.com/reel/1649266366591892",
+            Path(tempfile.mkdtemp()),
+            "Melhor disponível",
+            audio_only=False,
+            allow_playlist=False,
+            container="MP4",
+        )
+        tokens = worker._item_output_tokens({
+            "id": "single",
+            "url": "https://www.facebook.com/reel/1649266366591892",
+        })
+        self.assertIn("1649266366591892", tokens)
+
 
 class UpdateCheckTests(unittest.TestCase):
     def test_detects_new_release_and_installer_asset(self):
