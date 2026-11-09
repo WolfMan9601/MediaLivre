@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from functools import lru_cache
 from datetime import datetime, timezone
@@ -43,6 +44,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QScrollArea,
+    QSpinBox,
 )
 from yt_dlp import YoutubeDL
 from yt_dlp.extractor import gen_extractors
@@ -51,7 +53,7 @@ from download_scheduler import ScheduleStore, ScheduledDownload, default_databas
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.14.2"
+APP_VERSION = "0.15.0"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 DIRECT_MEDIA_EXTENSIONS = {
@@ -59,6 +61,9 @@ DIRECT_MEDIA_EXTENSIONS = {
     ".mp3", ".mp4", ".mpeg", ".mpg", ".oga", ".ogg", ".ogv", ".opus",
     ".wav", ".webm", ".wmv",
 }
+MAX_PARALLEL_URLS = 25
+DEFAULT_PARALLEL_DOWNLOADS = 2
+MAX_PARALLEL_DOWNLOADS = 4
 
 
 class _EmbeddedMediaParser(HTMLParser):
@@ -93,8 +98,15 @@ def _media_extension(url: str, content_type: str = "", filename: str = "") -> st
     return guessed.lower() if guessed and guessed.lower() in DIRECT_MEDIA_EXTENSIONS else ""
 
 
-def probe_direct_media_url(value: str, _visited: tuple[str, ...] = ()) -> dict | None:
+def probe_direct_media_url(
+    value: str,
+    _visited: tuple[str, ...] = (),
+    cancel_event: threading.Event | None = None,
+    timeout: int = 8,
+) -> dict | None:
     """Probe a public URL and return a direct media target or a standard HTML media source."""
+    if cancel_event and cancel_event.is_set():
+        raise DirectMediaCancelled()
     if not is_http_url(value) or value in _visited:
         return None
     request = Request(
@@ -106,7 +118,7 @@ def probe_direct_media_url(value: str, _visited: tuple[str, ...] = ()) -> dict |
         },
     )
     try:
-        with urlopen(request, timeout=20) as response:
+        with urlopen(request, timeout=timeout) as response:
             final_url = str(response.geturl() or value)
             content_type = str(response.headers.get("Content-Type") or "").lower()
             content_disposition = str(response.headers.get("Content-Disposition") or "")
@@ -126,6 +138,8 @@ def probe_direct_media_url(value: str, _visited: tuple[str, ...] = ()) -> dict |
                 return None
             html = response.read(1024 * 1024).decode("utf-8", errors="replace")
     except Exception:
+        if cancel_event and cancel_event.is_set():
+            raise DirectMediaCancelled()
         return None
 
     parser = _EmbeddedMediaParser()
@@ -135,8 +149,10 @@ def probe_direct_media_url(value: str, _visited: tuple[str, ...] = ()) -> dict |
         return None
     visited = (*_visited, value, final_url)
     for source in parser.sources:
+        if cancel_event and cancel_event.is_set():
+            raise DirectMediaCancelled()
         candidate = urljoin(final_url, source)
-        result = probe_direct_media_url(candidate, visited)
+        result = probe_direct_media_url(candidate, visited, cancel_event, timeout)
         if result:
             return result
     return None
@@ -160,6 +176,31 @@ def is_http_url(value: str) -> bool:
         )
     except ValueError:
         return False
+
+
+def parse_parallel_urls(value: str) -> list[str]:
+    """Validate a newline-separated batch and preserve unique URL order."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for line_number, raw_line in enumerate(str(value or "").splitlines(), start=1):
+        url = raw_line.strip()
+        if not url:
+            continue
+        if not is_http_url(url):
+            raise ValueError(f"A linha {line_number} não contém uma URL HTTP(S) válida.")
+        if url not in seen:
+            urls.append(url)
+            seen.add(url)
+    if len(urls) < 2:
+        raise ValueError("Introduza pelo menos duas URLs diferentes, uma por linha.")
+    if len(urls) > MAX_PARALLEL_URLS:
+        raise ValueError(f"O limite é {MAX_PARALLEL_URLS} URLs por lote.")
+    return urls
+
+
+def output_suffix_for_url(value: str) -> str:
+    """Return a short stable namespace so concurrent URLs cannot overwrite each other."""
+    return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()[:16]
 
 
 @lru_cache(maxsize=256)
@@ -711,6 +752,63 @@ class CollectionSelectionDialog(QDialog):
         return selected
 
 
+class ParallelDownloadDialog(QDialog):
+    def __init__(self, initial_url: str = "", parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Transferências simultâneas")
+        self.setMinimumWidth(540)
+        layout = QVBoxLayout(self)
+        heading = QLabel(
+            "Cole uma ligação por linha. O MediaLivre executa cada ligação como uma tarefa independente; "
+            "playlists dentro de uma ligação continuam sequenciais."
+        )
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+        self.urls_input = QTextEdit()
+        self.urls_input.setPlaceholderText("https://site/primeiro-vídeo\nhttps://site/segundo-vídeo")
+        self.urls_input.setPlainText(initial_url)
+        self.urls_input.setMinimumHeight(145)
+        layout.addWidget(self.urls_input)
+        concurrency_row = QHBoxLayout()
+        concurrency_row.addWidget(QLabel("Downloads em simultâneo:"))
+        self.concurrency = QSpinBox()
+        self.concurrency.setRange(2, MAX_PARALLEL_DOWNLOADS)
+        self.concurrency.setValue(DEFAULT_PARALLEL_DOWNLOADS)
+        self.concurrency.setToolTip(
+            "2 é o valor recomendado para equilibrar velocidade e carga. O máximo é 4."
+        )
+        concurrency_row.addWidget(self.concurrency)
+        concurrency_row.addStretch()
+        layout.addLayout(concurrency_row)
+        note = QLabel(
+            f"Pode incluir até {MAX_PARALLEL_URLS} ligações. Recomendado: 2 simultâneas; "
+            "mais tarefas podem dividir a largura de banda ou levar a limites do site. "
+            "Os ficheiros recebem um sufixo curto por URL para evitar colisões; URLs falhadas podem ser repetidas "
+            "enquanto esta janela estiver aberta."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        buttons.addButton("Iniciar lote", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _accept_if_valid(self) -> None:
+        try:
+            parse_parallel_urls(self.urls_input.toPlainText())
+        except ValueError as exc:
+            QMessageBox.warning(self, "URLs inválidas", str(exc))
+            return
+        self.accept()
+
+    def selected_urls(self) -> list[str]:
+        return parse_parallel_urls(self.urls_input.toPlainText())
+
+    def selected_concurrency(self) -> int:
+        return self.concurrency.value()
+
+
 class ReleaseSelectionDialog(QDialog):
     def __init__(self, releases: list[dict], current_version: str, parent=None) -> None:
         super().__init__(parent)
@@ -792,7 +890,8 @@ class DownloadWorker(QObject):
 
     def __init__(self, url: str, destination: Path, quality: str,
                  audio_only: bool, allow_playlist: bool, container: str = "Automático",
-                 download_thumbnail: bool = True, selected_items: list[dict] | None = None) -> None:
+                 download_thumbnail: bool = True, selected_items: list[dict] | None = None,
+                 output_suffix: str = "", socket_timeout: int = 20, retries: int = 3) -> None:
         super().__init__()
         self.url = url
         self.destination = destination
@@ -802,6 +901,9 @@ class DownloadWorker(QObject):
         self.container = container
         self.download_thumbnail = download_thumbnail
         self.selected_items = selected_items
+        self.output_suffix = re.sub(r"[^A-Za-z0-9_-]", "", output_suffix)[:16]
+        self.socket_timeout = max(3, int(socket_timeout))
+        self.retries = max(0, int(retries))
         self.cancel_requested = threading.Event()
         self.skip_requested = threading.Event()
         self.last_percent = -1
@@ -874,10 +976,16 @@ class DownloadWorker(QObject):
             "noplaylist": False,
             "ignoreerrors": True,
             "quiet": True,
-            "socket_timeout": 20,
+            "socket_timeout": self.socket_timeout,
+            "retries": self.retries,
+            "extractor_retries": self.retries,
         }
         with YoutubeDL(inspect_options) as ydl:
+            if self.cancel_requested.is_set():
+                raise DownloadError("Transferência cancelada pelo utilizador.")
             info = ydl.extract_info(self.url, download=False)
+        if self.cancel_requested.is_set():
+            raise DownloadError("Transferência cancelada pelo utilizador.")
         items = collection_items(info or {})
         self.collection_title = str((info or {}).get("title") or collection_label(self.url))
         if not items:
@@ -885,9 +993,14 @@ class DownloadWorker(QObject):
         return items
 
     def _download_options(self) -> dict:
+        title_limit = 160 if self.output_suffix else 180
+        output_template = f"%(title).{title_limit}B [%(id)s]"
+        if self.output_suffix:
+            output_template += f" [link-{self.output_suffix}]"
+        output_template += ".%(ext)s"
         options: dict = {
             "format": quality_format(self.quality, self.audio_only, self.container),
-            "outtmpl": str(self.destination / "%(title).180B [%(id)s].%(ext)s"),
+            "outtmpl": str(self.destination / output_template),
             "noplaylist": True,
             "windowsfilenames": True,
             "restrictfilenames": False,
@@ -898,9 +1011,9 @@ class DownloadWorker(QObject):
             "no_warnings": False,
             "logger": self,
             "ignoreerrors": False,
-            "socket_timeout": 20,
-            "retries": 3,
-            "fragment_retries": 3,
+            "socket_timeout": self.socket_timeout,
+            "retries": self.retries,
+            "fragment_retries": self.retries,
             "postprocessor_hooks": [self._postprocessor_hook],
         }
         location = ffmpeg_location()
@@ -958,8 +1071,32 @@ class DownloadWorker(QObject):
             return None
         extensions = {".mp4", ".mkv", ".avi"}
         candidates: list[Path] = []
+        try:
+            files = [candidate for candidate in self.destination.iterdir() if candidate.is_file()]
+        except OSError:
+            files = []
+        namespace = self.output_suffix or output_suffix_for_url(self.url)
+        direct_item_suffix = output_suffix_for_url(str(item.get("url") or self.url))
+        suffixes = [namespace]
+        if self.output_suffix:
+            suffixes.append(f"{self.output_suffix}-{direct_item_suffix}")
+        suffix_alternatives = "|".join(re.escape(suffix) for suffix in suffixes)
+        suffix_pattern = rf" \[link-(?:{suffix_alternatives})\]"
+        if not self.output_suffix:
+            suffix_pattern = rf"(?:{suffix_pattern})?"
         for token in self._item_output_tokens(item):
-            candidates.extend(self.destination.glob(f"* [{token}].*"))
+            pattern = re.compile(
+                rf"\[{re.escape(token)}\]{suffix_pattern}\.[^.]+$",
+                re.IGNORECASE,
+            )
+            candidates.extend(candidate for candidate in files if pattern.search(candidate.name))
+        if self.output_suffix:
+            direct_pattern = re.compile(
+                rf"\[link-{re.escape(self.output_suffix)}-{re.escape(direct_item_suffix)}\]"
+                rf"\.(?:mp4|mkv|avi)$",
+                re.IGNORECASE,
+            )
+            candidates.extend(candidate for candidate in files if direct_pattern.search(candidate.name))
         if self.last_output_path:
             candidates.append(self.last_output_path)
         for candidate in dict.fromkeys(candidates):
@@ -1015,22 +1152,34 @@ class DownloadWorker(QObject):
             stderr=subprocess.PIPE,
             text=True,
         )
-        while process.poll() is None:
+        error = ""
+        while True:
             if self.cancel_requested.is_set():
-                process.terminate()
+                if process.poll() is None:
+                    process.terminate()
                 try:
-                    process.wait(timeout=3)
+                    _, error = process.communicate(timeout=3)
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    process.wait()
+                    _, error = process.communicate()
                 raise DirectMediaCancelled()
-            time.sleep(0.1)
-        error = (process.stderr.read() if process.stderr else "").strip()
+            try:
+                _, error = process.communicate(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        error = (error or "").strip()
         if process.returncode:
             raise DirectMediaUnavailable(error or "O FFmpeg não conseguiu converter a URL direta.")
 
     def _download_direct_media(self, url: str, title: str) -> Path:
-        info = probe_direct_media_url(url)
+        info = probe_direct_media_url(
+            url,
+            cancel_event=self.cancel_requested,
+            timeout=self.socket_timeout,
+        )
+        if self.cancel_requested.is_set():
+            raise DirectMediaCancelled()
         if not info:
             raise DirectMediaUnavailable(
                 "A URL não devolveu um ficheiro de áudio/vídeo público nem uma tag HTML "
@@ -1041,6 +1190,9 @@ class DownloadWorker(QObject):
             raise DirectMediaUnavailable("O tipo do ficheiro direto não pôde ser identificado com segurança.")
         filename = str(info.get("filename") or "")
         stem = _safe_direct_stem(filename or title or "media")
+        if self.output_suffix:
+            item_suffix = output_suffix_for_url(url)
+            stem = f"{stem} [link-{self.output_suffix}-{item_suffix}]"
         target_extension = ".mp3" if self.audio_only else {
             "MP4": ".mp4",
             "MKV": ".mkv",
@@ -1048,9 +1200,17 @@ class DownloadWorker(QObject):
         }.get(self.container, source_extension)
         target = self.destination / f"{stem}{target_extension}"
         if target.exists():
-            self.log_line.emit(f"Ficheiro já existe; item ignorado: {target.name}")
-            self._direct_progress(100, title or target.name)
-            return target
+            if (
+                not self.audio_only
+                and target.suffix.lower() in {".mp4", ".mkv", ".avi"}
+                and media_has_video_stream(target) is False
+            ):
+                self.log_line.emit(f"Output direto inválido sem vídeo; a refazer: {target.name}")
+                target.unlink(missing_ok=True)
+            else:
+                self.log_line.emit(f"Ficheiro já existe; item ignorado: {target.name}")
+                self._direct_progress(100, title or target.name)
+                return target
         source_handle = tempfile.NamedTemporaryFile(
             mode="wb",
             prefix=f".{stem}.",
@@ -1060,14 +1220,14 @@ class DownloadWorker(QObject):
         )
         source = Path(source_handle.name)
         source_handle.close()
-        converted = target.with_name(f".{target.name}.part")
+        converted = target.with_name(f".{target.stem}.part{target.suffix}")
         try:
             request = Request(
                 str(info["url"]),
                 headers={"Accept": "*/*", "User-Agent": f"{APP_NAME}/{APP_VERSION}"},
             )
             self.log_line.emit(f"URL direta detetada: {info['url']}")
-            with urlopen(request, timeout=30) as response, source.open("wb") as output:
+            with urlopen(request, timeout=self.socket_timeout) as response, source.open("wb") as output:
                 try:
                     total = int(response.headers.get("Content-Length") or 0)
                 except (TypeError, ValueError):
@@ -1091,6 +1251,15 @@ class DownloadWorker(QObject):
                 converted.replace(target)
             else:
                 source.replace(target)
+            if (
+                not self.audio_only
+                and target.suffix.lower() in {".mp4", ".mkv", ".avi"}
+                and media_has_video_stream(target) is False
+            ):
+                target.unlink(missing_ok=True)
+                raise DirectMediaUnavailable(
+                    "A URL direta não contém uma faixa de vídeo. Escolha Extração de áudio ou uma URL de vídeo."
+                )
             self._direct_progress(100, title or target.name)
             return target
         finally:
@@ -1214,6 +1383,202 @@ class DownloadWorker(QObject):
         self.log_line.emit(f"Erro: {message}")
 
 
+class ParallelDownloadWorker(QObject):
+    progress = Signal(int, str)
+    item_progress = Signal(int, str)
+    log_line = Signal(str)
+    completed = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(
+        self,
+        urls: list[str],
+        destination: Path,
+        quality: str,
+        audio_only: bool,
+        allow_playlist: bool,
+        container: str,
+        download_thumbnail: bool,
+        concurrency: int = DEFAULT_PARALLEL_DOWNLOADS,
+    ) -> None:
+        super().__init__()
+        self.urls = list(urls)
+        self.destination = destination
+        self.quality = quality
+        self.audio_only = audio_only
+        self.allow_playlist = allow_playlist
+        self.container = container
+        self.download_thumbnail = download_thumbnail
+        self.concurrency = max(2, min(MAX_PARALLEL_DOWNLOADS, int(concurrency)))
+        self.cancel_requested = threading.Event()
+        self._lock = threading.RLock()
+        self._active_workers: dict[int, DownloadWorker] = {}
+        self._progress_values = [0] * len(self.urls)
+        self._item_progress_values = [0] * len(self.urls)
+        self._task_finished = [False] * len(self.urls)
+        self._done_count = 0
+        self.failure_count = 0
+        self.failed_urls: list[str] = []
+
+    def cancel(self) -> None:
+        self.cancel_requested.set()
+        with self._lock:
+            active = list(self._active_workers.values())
+        for worker in active:
+            worker.cancel()
+
+    def _emit_task_progress(self, index: int, percent: int, detail: str) -> None:
+        with self._lock:
+            self._progress_values[index] = max(0, min(100, int(percent)))
+            overall = sum(self._progress_values) // max(1, len(self._progress_values))
+            active_count = len(self._active_workers)
+            done_count = self._done_count
+        status = f"Lote: {done_count}/{len(self.urls)} concluídas · {active_count} ativas"
+        if detail:
+            status = f"{status} · {detail}"
+        self.progress.emit(overall, status)
+
+    def _emit_item_progress(self, index: int, percent: int, label: str) -> None:
+        with self._lock:
+            self._item_progress_values[index] = max(0, min(100, int(percent)))
+            average = sum(self._item_progress_values) // max(1, len(self._item_progress_values))
+        self.item_progress.emit(average, f"Ligação {index + 1}/{len(self.urls)} · {label}")
+
+    def _finish_task(self, index: int, status: str) -> None:
+        with self._lock:
+            if self._task_finished[index]:
+                return
+            self._task_finished[index] = True
+            if status == "completed":
+                self._progress_values[index] = 100
+                self._item_progress_values[index] = 100
+            self._done_count += 1
+            done_count = self._done_count
+            overall = sum(self._progress_values) // max(1, len(self._progress_values))
+            item_average = sum(self._item_progress_values) // max(1, len(self._item_progress_values))
+        self.progress.emit(overall, f"Lote: {done_count}/{len(self.urls)} tarefas terminadas")
+        self.item_progress.emit(item_average, f"Ligação {index + 1}/{len(self.urls)} · {status}")
+
+    def _run_one(self, index: int, url: str) -> tuple[str, str]:
+        if self.cancel_requested.is_set():
+            self._finish_task(index, "cancelled")
+            return "cancelled", ""
+        try:
+            worker = DownloadWorker(
+                url=url,
+                destination=self.destination,
+                quality=self.quality,
+                audio_only=self.audio_only,
+                allow_playlist=self.allow_playlist,
+                container=self.container,
+                download_thumbnail=self.download_thumbnail,
+                output_suffix=output_suffix_for_url(url),
+                socket_timeout=8,
+                retries=1,
+            )
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            self.log_line.emit(f"[{index + 1}/{len(self.urls)}] Falhou ao preparar a transferência: {message}")
+            self._finish_task(index, "failed")
+            return "failed", message
+        state = {"status": "", "message": "", "error_logged": False}
+        worker.progress.connect(
+            lambda percent, detail, item=index: self._emit_task_progress(item, percent, detail)
+        )
+        worker.item_progress.connect(
+            lambda percent, label, item=index: self._emit_item_progress(item, percent, label)
+        )
+        def forward_log(text: str) -> None:
+            if str(text).startswith(("Erro:", "Erro no item")):
+                state["error_logged"] = True
+            self.log_line.emit(f"[{index + 1}/{len(self.urls)}] {text}")
+
+        worker.log_line.connect(forward_log)
+        worker.completed.connect(lambda _path: state.update(status="completed"))
+        worker.failed.connect(
+            lambda message: state.update(status="failed", message=str(message))
+        )
+        worker.cancelled.connect(lambda: state.update(status="cancelled"))
+        with self._lock:
+            self._active_workers[index] = worker
+            cancel_now = self.cancel_requested.is_set()
+        if cancel_now:
+            worker.cancel()
+        self.log_line.emit(f"[{index + 1}/{len(self.urls)}] A iniciar: {url}")
+        try:
+            worker.run()
+        except Exception as exc:
+            state.update(status="failed", message=str(exc).strip() or exc.__class__.__name__)
+        finally:
+            if not state["status"]:
+                state.update(
+                    status="cancelled" if self.cancel_requested.is_set() else "failed",
+                    message="A tarefa terminou sem comunicar um resultado.",
+                )
+            with self._lock:
+                self._active_workers.pop(index, None)
+            self._finish_task(index, str(state["status"]))
+        if state["status"] == "completed":
+            self.log_line.emit(f"[{index + 1}/{len(self.urls)}] Transferência concluída.")
+        elif state["status"] == "failed" and not state["error_logged"]:
+            self.log_line.emit(f"[{index + 1}/{len(self.urls)}] Falhou: {state['message']}")
+        return str(state["status"]), str(state["message"])
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self._run_batch()
+        except Exception as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            self.failed.emit(f"Não foi possível executar o lote: {message}")
+
+    def _run_batch(self) -> None:
+        if len(self.urls) < 2:
+            self.failed.emit("O lote precisa de pelo menos duas URLs diferentes.")
+            return
+        self.destination.mkdir(parents=True, exist_ok=True)
+        self.progress.emit(0, f"A iniciar lote · máximo de {self.concurrency} transferências simultâneas")
+        results: list[tuple[int, str, str]] = []
+        with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="medialivre-download") as pool:
+            futures = {
+                pool.submit(self._run_one, index, url): (index, url)
+                for index, url in enumerate(self.urls)
+            }
+            for future in as_completed(futures):
+                index, url = futures[future]
+                try:
+                    status, message = future.result()
+                except Exception as exc:
+                    status, message = "failed", str(exc).strip() or exc.__class__.__name__
+                    self.log_line.emit(f"[{index + 1}/{len(self.urls)}] Falhou: {message}")
+                    self._finish_task(index, status)
+                results.append((index, status, message))
+        self.failed_urls = [self.urls[index] for index, status, _ in results if status == "failed"]
+        if self.cancel_requested.is_set() or any(status == "cancelled" for _, status, _ in results):
+            with self._lock:
+                done_count = self._done_count
+                overall = sum(self._progress_values) // max(1, len(self._progress_values))
+            self.progress.emit(overall, f"Lote cancelado · {done_count}/{len(self.urls)} tarefas terminadas")
+            self.cancelled.emit()
+            return
+        successes = sum(status == "completed" for _, status, _ in results)
+        failures = [message for _, status, message in results if status == "failed"]
+        self.failure_count = len(failures)
+        if failures and successes == 0:
+            self.failed.emit(
+                f"Nenhuma transferência do lote foi concluída ({len(failures)} falha(s)). "
+                "Consulte as mensagens por ligação acima."
+            )
+            return
+        if failures:
+            self.log_line.emit(f"Lote parcialmente concluído: {successes} concluídas, {len(failures)} falharam.")
+        else:
+            self.log_line.emit(f"Lote concluído: {successes} transferências.")
+        self.progress.emit(100, "Lote concluído")
+        self.completed.emit(str(self.destination))
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1222,6 +1587,8 @@ class MainWindow(QMainWindow):
         self.resize(940, 760)
         self.thread: QThread | None = None
         self.worker: DownloadWorker | None = None
+        self.batch_thread: QThread | None = None
+        self.batch_worker: ParallelDownloadWorker | None = None
         self.selection_thread: QThread | None = None
         self.selection_worker: CollectionInspectWorker | None = None
         self.update_thread: QThread | None = None
@@ -1236,6 +1603,15 @@ class MainWindow(QMainWindow):
         self._prepared_items: list[dict] | None = None
         self._active_schedule_id: str | None = None
         self._close_when_idle = False
+        self._failed_batch_urls: list[str] = []
+        self._last_batch_concurrency = DEFAULT_PARALLEL_DOWNLOADS
+        self._retrying_failed_url: str | None = None
+        self._retrying_output_suffix: str | None = None
+        self._retry_single_active_url: str | None = None
+        self._retry_single_active_suffix: str | None = None
+        self._batch_terminal_received = False
+        self._batch_cleanup_scheduled = False
+        self._batch_failure_count = 0
         self.destination = Path.home() / "Downloads"
         self.schedule_store = ScheduleStore()
         self.schedule_store.recover_interrupted_jobs()
@@ -1295,6 +1671,20 @@ class MainWindow(QMainWindow):
         self.url_input.setClearButtonEnabled(True)
         self.url_input.returnPressed.connect(lambda: self.start_download())
         card_layout.addWidget(self.url_input)
+        batch_row = QHBoxLayout()
+        batch_row.addStretch()
+        self.batch_button = QPushButton("Transferir várias ligações…")
+        self.batch_button.setToolTip(
+            "Cole várias URLs e transfira até quatro tarefas ao mesmo tempo; duas é o valor recomendado."
+        )
+        self.batch_button.clicked.connect(self._open_parallel_download_dialog)
+        batch_row.addWidget(self.batch_button)
+        self.retry_failed_button = QPushButton("Repetir URLs falhadas")
+        self.retry_failed_button.setVisible(False)
+        self.retry_failed_button.setEnabled(False)
+        self.retry_failed_button.clicked.connect(self._retry_failed_batch)
+        batch_row.addWidget(self.retry_failed_button)
+        card_layout.addLayout(batch_row)
 
         controls = QHBoxLayout()
         controls.setSpacing(12)
@@ -1476,10 +1866,96 @@ class MainWindow(QMainWindow):
             return
         self._begin_collection_selection(url, start_after=False)
 
+    def _open_parallel_download_dialog(self) -> None:
+        if self.thread is not None or self.batch_thread is not None:
+            return
+        dialog = ParallelDownloadDialog(self.url_input.text().strip(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.start_parallel_download(dialog.selected_urls(), dialog.selected_concurrency())
+
+    def start_parallel_download(self, urls: list[str], concurrency: int) -> None:
+        try:
+            urls = parse_parallel_urls("\n".join(urls))
+        except ValueError as exc:
+            QMessageBox.warning(self, "URLs inválidas", str(exc))
+            return
+        if self.thread is not None or self.batch_thread is not None:
+            QMessageBox.information(self, "Transferência em curso", "Conclua ou cancele o trabalho atual primeiro.")
+            return
+        self._failed_batch_urls = []
+        self._retrying_failed_url = None
+        self._retrying_output_suffix = None
+        self._retry_single_active_url = None
+        self._retry_single_active_suffix = None
+        self._last_batch_concurrency = max(2, min(MAX_PARALLEL_DOWNLOADS, int(concurrency)))
+        self._batch_terminal_received = False
+        self._batch_cleanup_scheduled = False
+        self._batch_failure_count = 0
+        self.retry_failed_button.setVisible(False)
+        self.log.clear()
+        self.progress.setValue(0)
+        self.percent_label.setText("0%")
+        self.item_progress_bar.setValue(0)
+        self.item_percent.setText("0%")
+        self.item_label.setText(f"A preparar lote com {len(urls)} ligações…")
+        self.status_label.setText("A iniciar transferências simultâneas…")
+        self.batch_thread = QThread(self)
+        self.batch_worker = ParallelDownloadWorker(
+            urls=urls,
+            destination=self.destination,
+            quality=self.quality.currentText(),
+            audio_only=self.audio_only.isChecked(),
+            allow_playlist=self.playlist_check.isChecked(),
+            container=self.video_format.currentText(),
+            download_thumbnail=self.thumbnail_check.isChecked(),
+            concurrency=self._last_batch_concurrency,
+        )
+        self.batch_worker.moveToThread(self.batch_thread)
+        self.batch_thread.started.connect(self.batch_worker.run)
+        self.batch_worker.progress.connect(self._on_progress)
+        self.batch_worker.item_progress.connect(self._on_item_progress)
+        self.batch_worker.log_line.connect(self._append_log)
+        self.batch_worker.completed.connect(self._on_batch_completed)
+        self.batch_worker.failed.connect(self._on_batch_failed)
+        self.batch_worker.cancelled.connect(self._on_batch_cancelled)
+        self.batch_worker.completed.connect(self.batch_thread.quit)
+        self.batch_worker.failed.connect(self.batch_thread.quit)
+        self.batch_worker.cancelled.connect(self.batch_thread.quit)
+        self.batch_thread.finished.connect(self._batch_thread_finished)
+        self._set_busy(True)
+        self.cancel_button.setEnabled(True)
+        self.skip_button.setEnabled(False)
+        self.batch_thread.start()
+
+    def _retry_failed_batch(self) -> None:
+        failed_urls = list(self._failed_batch_urls)
+        if not failed_urls:
+            return
+        if len(failed_urls) == 1:
+            self._retrying_failed_url = failed_urls[0]
+            self._retrying_output_suffix = output_suffix_for_url(failed_urls[0])
+            self.url_input.setText(failed_urls[0])
+            self.start_download()
+        else:
+            self.start_parallel_download(failed_urls, self._last_batch_concurrency)
+
+    def _finish_single_retry(self, retryable: bool) -> None:
+        url = self._retry_single_active_url
+        if not url:
+            return
+        self._retry_single_active_url = None
+        self._retry_single_active_suffix = None
+        self._failed_batch_urls = [url] if retryable else []
+        if retryable:
+            self.retry_failed_button.setText("Repetir 1 URL falhada")
+            self.retry_failed_button.setVisible(True)
+            self.retry_failed_button.setEnabled(False)
+
     def _begin_collection_selection(self, url: str, start_after: bool) -> None:
         if self.selection_thread and self.selection_thread.isRunning():
             return
-        if self.thread and self.thread.isRunning():
+        if self.thread is not None or self.batch_thread is not None:
             return
         self._selection_start_after = start_after
         self.status_label.setText("A ler a coleção…")
@@ -1507,6 +1983,8 @@ class MainWindow(QMainWindow):
         if not selected:
             self._prepared_items_url = None
             self._prepared_items = None
+            self._retrying_failed_url = None
+            self._retrying_output_suffix = None
             self.status_label.setText("Seleção cancelada")
             return
         if start_after:
@@ -1520,6 +1998,8 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_collection_failed(self, message: str) -> None:
         self._selection_start_after = False
+        self._retrying_failed_url = None
+        self._retrying_output_suffix = None
         self._set_busy(False)
         self.status_label.setText("Não foi possível ler a coleção")
         self._append_log(f"Erro ao ler a coleção: {message}")
@@ -1605,11 +2085,11 @@ class MainWindow(QMainWindow):
     def _start_installer_download(self, release: dict) -> None:
         if self.install_update_thread and self.install_update_thread.isRunning():
             return
-        if self.thread and self.thread.isRunning():
+        if self.thread is not None or self.batch_thread is not None:
             QMessageBox.information(
                 self,
                 "Transferência em curso",
-                "Conclua ou cancele a transferência atual antes de atualizar o MediaLivre.",
+                "Conclua ou cancele as transferências atuais antes de atualizar o MediaLivre.",
             )
             return
         installer_url = str(release.get("installer_url") or "")
@@ -1800,7 +2280,11 @@ class MainWindow(QMainWindow):
             self._refresh_scheduled_jobs()
 
     def _run_due_schedules(self) -> None:
-        if self._active_schedule_id or (self.thread and self.thread.isRunning()):
+        if (
+            self._active_schedule_id
+            or self.thread is not None
+            or self.batch_thread is not None
+        ):
             return
         try:
             job = self.schedule_store.claim_next_due()
@@ -1887,6 +2371,7 @@ class MainWindow(QMainWindow):
         self,
         scheduled_job: ScheduledDownload | None = None,
         selected_items: list[dict] | None = None,
+        output_suffix: str | None = None,
     ) -> None:
         if scheduled_job:
             options = scheduled_job.options
@@ -1910,7 +2395,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Ligação inválida", "Introduza uma ligação completa http:// ou https://.")
                 self.url_input.setFocus()
             return
-        if self.thread and self.thread.isRunning():
+        if self.thread is not None or self.batch_thread is not None:
             return
         if scheduled_job is None and selected_items is None:
             if self._prepared_items_url == url and self._prepared_items is not None:
@@ -1920,6 +2405,14 @@ class MainWindow(QMainWindow):
             elif playlist_enabled(url, self.playlist_check.isChecked()):
                 self._begin_collection_selection(url, start_after=True)
                 return
+        if self._retrying_failed_url == url:
+            output_suffix = self._retrying_output_suffix
+            self._failed_batch_urls = []
+            self._retry_single_active_url = url
+            self._retry_single_active_suffix = output_suffix
+            self._retrying_failed_url = None
+            self._retrying_output_suffix = None
+            self.retry_failed_button.setVisible(False)
         self.log.clear()
         self.progress.setValue(0)
         self.percent_label.setText("0%")
@@ -1939,6 +2432,7 @@ class MainWindow(QMainWindow):
             container=self.video_format.currentText(),
             download_thumbnail=self.thumbnail_check.isChecked(),
             selected_items=selected_items,
+            output_suffix=output_suffix,
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -1959,6 +2453,13 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def cancel_download(self) -> None:
+        if self.batch_worker:
+            self.batch_worker.cancel()
+            self.status_label.setText("A cancelar as transferências simultâneas…")
+            self.cancel_button.setEnabled(False)
+            self.skip_button.setEnabled(False)
+            self._append_log("Cancelamento solicitado para todas as tarefas ativas do lote.")
+            return
         if self.worker:
             self.worker.cancel()
             self.status_label.setText("A cancelar com segurança…")
@@ -2002,38 +2503,117 @@ class MainWindow(QMainWindow):
         self.percent_label.setText("100%")
         self.status_label.setText("Transferência concluída")
         self._append_log(f"Concluído. Pasta: {folder}")
+        self._finish_single_retry(retryable=False)
         self._finish_active_schedule("completed")
-        self._set_busy(False)
+
+    @Slot(str)
+    def _on_batch_completed(self, folder: str) -> None:
+        self._batch_terminal_received = True
+        has_failures = self._batch_failure_count > 0 or bool(
+            self.batch_worker and self.batch_worker.failure_count
+        )
+        if not has_failures:
+            self.progress.setValue(100)
+            self.percent_label.setText("100%")
+        self.status_label.setText("Lote concluído com falhas" if has_failures else "Lote concluído")
+        self._append_log(f"Lote concluído. Pasta: {folder}")
+        self._update_batch_retry()
+
+    @Slot(str)
+    def _on_batch_failed(self, message: str) -> None:
+        self._batch_terminal_received = True
+        self.status_label.setText("O lote não foi concluído")
+        self._append_log(message)
+        self._update_batch_retry()
+
+    @Slot()
+    def _on_batch_cancelled(self) -> None:
+        self._batch_terminal_received = True
+        self.status_label.setText("Lote cancelado")
+        self._append_log("As transferências simultâneas foram canceladas.")
+        self._update_batch_retry()
+
+    def _update_batch_retry(self) -> None:
+        if self.batch_worker and self.batch_worker.failed_urls:
+            self._failed_batch_urls = list(self.batch_worker.failed_urls)
+        count = len(self._failed_batch_urls)
+        self.retry_failed_button.setText(f"Repetir {count} URL(s) falhadas")
+        self.retry_failed_button.setVisible(count > 0)
+        self.retry_failed_button.setEnabled(False)
 
     @Slot(str)
     def _on_failed(self, message: str) -> None:
         self.status_label.setText("A transferência não foi concluída")
         self._append_log(message)
+        self._finish_single_retry(retryable=True)
         self._finish_active_schedule("failed", message)
-        self._set_busy(False)
 
     @Slot()
     def _on_cancelled(self) -> None:
         self.status_label.setText("Transferência cancelada")
         self._append_log("A transferência foi cancelada.")
+        self._finish_single_retry(retryable=True)
         self._finish_active_schedule("cancelled")
-        self._set_busy(False)
 
     @Slot()
     def _thread_finished(self) -> None:
+        finished_thread = self.sender()
+        if finished_thread is not None and finished_thread is not self.thread:
+            return
         if self.worker:
             self.worker.deleteLater()
         if self.thread:
             self.thread.deleteLater()
         self.worker = None
         self.thread = None
+        self._set_busy(False)
+        if self._close_when_idle:
+            self._close_when_idle = False
+            self.close()
+
+    @Slot()
+    def _batch_thread_finished(self) -> None:
+        finished_thread = self.sender()
+        if finished_thread is not None and finished_thread is not self.batch_thread:
+            return
+        if self.batch_worker:
+            self._batch_failure_count = self.batch_worker.failure_count
+            self._failed_batch_urls = list(self.batch_worker.failed_urls)
+        if not self._batch_terminal_received:
+            if not self._batch_cleanup_scheduled:
+                self._batch_cleanup_scheduled = True
+                QTimer.singleShot(0, self._finalize_batch_thread)
+            return
+        self._finalize_batch_thread()
+
+    @Slot()
+    def _finalize_batch_thread(self) -> None:
+        self._batch_cleanup_scheduled = False
+        if self.batch_thread is None:
+            return
+        if not self._batch_terminal_received:
+            self.status_label.setText("O lote terminou sem comunicar um resultado")
+            self._append_log("Erro: a thread do lote terminou inesperadamente.")
+            self._failed_batch_urls = list(self.batch_worker.urls) if self.batch_worker else []
+            if self._failed_batch_urls:
+                self._update_batch_retry()
+        if self.batch_worker:
+            self.batch_worker.deleteLater()
+        if self.batch_thread:
+            self.batch_thread.deleteLater()
+        self.batch_worker = None
+        self.batch_thread = None
+        self._set_busy(False)
         if self._close_when_idle:
             self._close_when_idle = False
             self.close()
 
     def _set_busy(self, busy: bool) -> None:
         self.start_button.setEnabled(not busy)
-        self.cancel_button.setEnabled(busy and self.worker is not None)
+        self.batch_button.setEnabled(not busy)
+        self.retry_failed_button.setVisible(bool(self._failed_batch_urls))
+        self.retry_failed_button.setEnabled(not busy and bool(self._failed_batch_urls))
+        self.cancel_button.setEnabled(busy and (self.worker is not None or self.batch_worker is not None))
         self.skip_button.setEnabled(busy and self.worker is not None)
         self.browse_button.setEnabled(not busy)
         self.choose_items_button.setEnabled(not busy)
@@ -2050,11 +2630,19 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.destination)))
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        if self.thread and self.thread.isRunning():
+        single_running = bool(self.thread and self.thread.isRunning())
+        batch_running = bool(self.batch_thread and self.batch_thread.isRunning())
+        if (self.thread is not None and not single_running) or (
+            self.batch_thread is not None and not batch_running
+        ):
+            self._close_when_idle = True
+            event.ignore()
+            return
+        if single_running or batch_running:
             answer = QMessageBox.question(
                 self,
                 "Transferência em curso",
-                "Há uma transferência ativa. Pretende cancelá-la e fechar?",
+                "Há transferências ativas. Pretende cancelá-las e fechar?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -2062,6 +2650,8 @@ class MainWindow(QMainWindow):
                 self._close_when_idle = True
                 if self.worker:
                     self.worker.cancel()
+                if self.batch_worker:
+                    self.batch_worker.cancel()
                 self.status_label.setText("A cancelar antes de fechar…")
                 event.ignore()
             else:

@@ -3,13 +3,18 @@ import io
 import json
 import hashlib
 import tempfile
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
+from PySide6.QtCore import QObject, Qt, Signal
 from yt_dlp.utils import DownloadError
 
 from medialivre import (
+    DirectMediaCancelled,
     DownloadWorker,
     InstallerDownloadWorker,
+    ParallelDownloadWorker,
     SkipCurrentItem,
     UpdateCheckWorker,
     collection_items,
@@ -19,10 +24,13 @@ from medialivre import (
     is_http_url,
     media_processing_options,
     matching_extractors,
+    output_suffix_for_url,
+    parse_parallel_urls,
     playlist_enabled,
     progress_details,
     quality_format,
     should_try_direct_media,
+    probe_direct_media_url,
     start_installer_process,
     user_facing_download_error,
     version_tuple,
@@ -144,6 +152,285 @@ class UrlValidationTests(unittest.TestCase):
             "url": "https://www.facebook.com/reel/1649266366591892",
         })
         self.assertIn("1649266366591892", tokens)
+
+    def test_parse_parallel_urls_deduplicates_and_validates(self):
+        urls = parse_parallel_urls(
+            " https://example.test/a \nhttps://example.test/b\n\nhttps://example.test/a"
+        )
+        self.assertEqual(urls, ["https://example.test/a", "https://example.test/b"])
+        with self.assertRaisesRegex(ValueError, "duas URLs"):
+            parse_parallel_urls("https://example.test/a\nhttps://example.test/a")
+        with self.assertRaisesRegex(ValueError, "linha 2"):
+            parse_parallel_urls("https://example.test/a\nfile:///tmp/video.mp4")
+
+    def test_parallel_output_namespaces_are_stable_and_unique_per_url(self):
+        first = "https://cdn.example.test/file.mp4?sig=one"
+        second = "https://cdn.example.test/file.mp4?sig=two"
+        self.assertEqual(output_suffix_for_url(first), output_suffix_for_url(first))
+        self.assertNotEqual(output_suffix_for_url(first), output_suffix_for_url(second))
+
+    def test_invalid_video_lookup_does_not_cross_parallel_namespaces(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir)
+            item = {"id": "same-video-id", "url": "https://example.test/video"}
+            output_a = destination / f"Title [same-video-id] [link-{'a' * 16}].mp4"
+            output_a.write_bytes(b"old invalid file")
+            legacy_output = destination / "Legacy [same-video-id].mp4"
+            legacy_output.write_bytes(b"old legacy file")
+            worker_a = DownloadWorker(
+                "https://example.test/source-a", destination, "Melhor disponível",
+                audio_only=False, allow_playlist=False, container="MP4", output_suffix="a" * 16,
+            )
+            worker_b = DownloadWorker(
+                "https://example.test/source-b", destination, "Melhor disponível",
+                audio_only=False, allow_playlist=False, container="MP4", output_suffix="b" * 16,
+            )
+            worker_single = DownloadWorker(
+                "https://example.test/source-single", destination, "Melhor disponível",
+                audio_only=False, allow_playlist=False, container="MP4",
+            )
+            with patch("medialivre.media_has_video_stream", return_value=False):
+                self.assertIsNone(worker_b._existing_invalid_video(item))
+                self.assertEqual(worker_a._existing_invalid_video(item), output_a)
+                self.assertEqual(worker_single._existing_invalid_video(item), legacy_output)
+
+    def test_direct_media_probe_stops_immediately_when_cancelled(self):
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with self.assertRaises(DirectMediaCancelled):
+            probe_direct_media_url("https://example.test/media", cancel_event=cancel_event)
+
+
+class ParallelDownloadTests(unittest.TestCase):
+    def test_runs_no_more_than_configured_workers_and_completes_all(self):
+        lock = threading.Lock()
+        rendezvous = threading.Barrier(2)
+        activity = {"active": 0, "maximum": 0}
+        completed = []
+        failed = []
+        output_suffixes = []
+
+        class FakeDownloadWorker(QObject):
+            progress = Signal(int, str)
+            item_progress = Signal(int, str)
+            log_line = Signal(str)
+            completed = Signal(str)
+            failed = Signal(str)
+            cancelled = Signal()
+
+            def __init__(self, **kwargs):
+                super().__init__()
+                self.destination = kwargs["destination"]
+                output_suffixes.append(kwargs["output_suffix"])
+
+            def cancel(self):
+                return None
+
+            def run(self):
+                with lock:
+                    activity["active"] += 1
+                    activity["maximum"] = max(activity["maximum"], activity["active"])
+                try:
+                    self.progress.emit(40, "teste")
+                    rendezvous.wait(timeout=3)
+                    time.sleep(0.02)
+                    self.completed.emit(str(self.destination))
+                finally:
+                    with lock:
+                        activity["active"] -= 1
+
+        urls = [f"https://example.test/video/{index}" for index in range(4)]
+        batch = ParallelDownloadWorker(
+            urls, Path(tempfile.mkdtemp()), "Melhor disponível", False, False,
+            "Automático", False, concurrency=2,
+        )
+        batch.completed.connect(completed.append)
+        batch.failed.connect(failed.append)
+        with patch("medialivre.DownloadWorker", side_effect=FakeDownloadWorker):
+            batch.run()
+        self.assertEqual(activity["maximum"], 2)
+        self.assertEqual(batch._done_count, 4)
+        self.assertEqual(len(set(output_suffixes)), 4)
+        self.assertEqual(len(completed), 1)
+        self.assertFalse(failed, failed)
+
+    def test_failed_batch_does_not_repeat_worker_error_messages(self):
+        log_lines = []
+        failures = []
+
+        class FakeDownloadWorker(QObject):
+            progress = Signal(int, str)
+            item_progress = Signal(int, str)
+            log_line = Signal(str)
+            completed = Signal(str)
+            failed = Signal(str)
+            cancelled = Signal()
+
+            def __init__(self, **_kwargs):
+                super().__init__()
+
+            def cancel(self):
+                return None
+
+            def run(self):
+                self.log_line.emit("Erro: serviço indisponível")
+                self.failed.emit("serviço indisponível")
+
+        batch = ParallelDownloadWorker(
+            ["https://example.test/one", "https://example.test/two"],
+            Path(tempfile.mkdtemp()), "Melhor disponível", False, False,
+            "Automático", False, concurrency=2,
+        )
+        batch.log_line.connect(log_lines.append, Qt.ConnectionType.DirectConnection)
+        batch.failed.connect(failures.append, Qt.ConnectionType.DirectConnection)
+        with patch("medialivre.DownloadWorker", side_effect=FakeDownloadWorker):
+            batch.run()
+        self.assertEqual(sum("serviço indisponível" in line for line in log_lines), 2)
+        self.assertFalse(any("Falhou:" in line for line in log_lines))
+        self.assertEqual(len(failures), 1)
+        self.assertIn("2 falha(s)", failures[0])
+        self.assertEqual(set(batch.failed_urls), {"https://example.test/one", "https://example.test/two"})
+
+    def test_partial_batch_exposes_only_failed_urls_for_retry(self):
+        completed = []
+
+        class FakeDownloadWorker(QObject):
+            progress = Signal(int, str)
+            item_progress = Signal(int, str)
+            log_line = Signal(str)
+            completed = Signal(str)
+            failed = Signal(str)
+            cancelled = Signal()
+
+            def __init__(self, **kwargs):
+                super().__init__()
+                self.url = kwargs["url"]
+
+            def cancel(self):
+                return None
+
+            def run(self):
+                if self.url.endswith("bad"):
+                    self.failed.emit("serviço indisponível")
+                else:
+                    self.completed.emit("/tmp")
+
+        urls = ["https://example.test/good", "https://example.test/bad"]
+        batch = ParallelDownloadWorker(
+            urls, Path(tempfile.mkdtemp()), "Melhor disponível", False, False,
+            "Automático", False, concurrency=2,
+        )
+        batch.completed.connect(completed.append, Qt.ConnectionType.DirectConnection)
+        with patch("medialivre.DownloadWorker", side_effect=FakeDownloadWorker):
+            batch.run()
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(batch.failure_count, 1)
+        self.assertEqual(batch.failed_urls, ["https://example.test/bad"])
+
+    def test_cancelled_batch_preserves_failures_that_happened_before_cancel(self):
+        failed_logged = threading.Event()
+        active_started = threading.Event()
+        cancelled = []
+
+        class FakeDownloadWorker(QObject):
+            progress = Signal(int, str)
+            item_progress = Signal(int, str)
+            log_line = Signal(str)
+            completed = Signal(str)
+            failed = Signal(str)
+            cancelled = Signal()
+
+            def __init__(self, **kwargs):
+                super().__init__()
+                self.url = kwargs["url"]
+                self.stop = threading.Event()
+
+            def cancel(self):
+                self.stop.set()
+
+            def run(self):
+                if self.url.endswith("bad"):
+                    self.log_line.emit("Erro: falha simulada")
+                    self.failed.emit("falha simulada")
+                    failed_logged.set()
+                    return
+                active_started.set()
+                self.stop.wait(timeout=3)
+                self.cancelled.emit()
+
+        bad = "https://example.test/bad"
+        batch = ParallelDownloadWorker(
+            [bad, "https://example.test/slow", "https://example.test/queued"],
+            Path(tempfile.mkdtemp()), "Melhor disponível", False, False,
+            "Automático", False, concurrency=2,
+        )
+        batch.cancelled.connect(lambda: cancelled.append(True), Qt.ConnectionType.DirectConnection)
+        with patch("medialivre.DownloadWorker", side_effect=FakeDownloadWorker):
+            thread = threading.Thread(target=batch.run)
+            thread.start()
+            self.assertTrue(failed_logged.wait(timeout=3))
+            self.assertTrue(active_started.wait(timeout=3))
+            batch.cancel()
+            thread.join(timeout=4)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(batch.failed_urls, [bad])
+        self.assertEqual(batch._done_count, 3)
+
+    def test_cancel_stops_all_active_workers(self):
+        lock = threading.Lock()
+        both_started = threading.Event()
+        active = {"count": 0}
+        cancelled = []
+        progress_states = []
+        stop_events = []
+
+        class FakeDownloadWorker(QObject):
+            progress = Signal(int, str)
+            item_progress = Signal(int, str)
+            log_line = Signal(str)
+            completed = Signal(str)
+            failed = Signal(str)
+            cancelled = Signal()
+
+            def __init__(self, **_kwargs):
+                super().__init__()
+                self.stop = threading.Event()
+                stop_events.append(self.stop)
+
+            def cancel(self):
+                self.stop.set()
+
+            def run(self):
+                with lock:
+                    active["count"] += 1
+                    if active["count"] == 2:
+                        both_started.set()
+                self.stop.wait(timeout=5)
+                self.cancelled.emit()
+
+        urls = ["https://example.test/one", "https://example.test/two", "https://example.test/three"]
+        batch = ParallelDownloadWorker(
+            urls, Path(tempfile.mkdtemp()), "Melhor disponível", False, False,
+            "Automático", False, concurrency=2,
+        )
+        batch.cancelled.connect(lambda: cancelled.append(True), Qt.ConnectionType.DirectConnection)
+        batch.progress.connect(
+            lambda _percent, detail: progress_states.append(detail), Qt.ConnectionType.DirectConnection
+        )
+        with patch("medialivre.DownloadWorker", side_effect=FakeDownloadWorker):
+            thread = threading.Thread(target=batch.run)
+            thread.start()
+            self.assertTrue(both_started.wait(timeout=3))
+            batch.cancel()
+            thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(cancelled), 1)
+        self.assertEqual(len(stop_events), 2)
+        self.assertTrue(all(event.is_set() for event in stop_events))
+        self.assertEqual(batch._done_count, 3)
+        self.assertTrue(all(batch._task_finished))
+        self.assertIn("3/3 tarefas terminadas", progress_states[-1])
 
 
 class UpdateCheckTests(unittest.TestCase):
