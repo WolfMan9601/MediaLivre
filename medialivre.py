@@ -53,7 +53,7 @@ from download_scheduler import ScheduleStore, ScheduledDownload, default_databas
 from urllib.request import Request, urlopen
 
 APP_NAME = "MediaLivre"
-APP_VERSION = "0.15.0"
+APP_VERSION = "0.15.1"
 UPDATE_REPOSITORY = os.environ.get("MEDIALIVRE_UPDATE_REPOSITORY", "WolfMan9601/MediaLivre")
 
 DIRECT_MEDIA_EXTENSIONS = {
@@ -891,7 +891,7 @@ class DownloadWorker(QObject):
     def __init__(self, url: str, destination: Path, quality: str,
                  audio_only: bool, allow_playlist: bool, container: str = "Automático",
                  download_thumbnail: bool = True, selected_items: list[dict] | None = None,
-                 output_suffix: str = "", socket_timeout: int = 20, retries: int = 3) -> None:
+                 output_suffix: str | None = None, socket_timeout: int = 20, retries: int = 3) -> None:
         super().__init__()
         self.url = url
         self.destination = destination
@@ -901,7 +901,7 @@ class DownloadWorker(QObject):
         self.container = container
         self.download_thumbnail = download_thumbnail
         self.selected_items = selected_items
-        self.output_suffix = re.sub(r"[^A-Za-z0-9_-]", "", output_suffix)[:16]
+        self.output_suffix = re.sub(r"[^A-Za-z0-9_-]", "", str(output_suffix or ""))[:16]
         self.socket_timeout = max(3, int(socket_timeout))
         self.retries = max(0, int(retries))
         self.cancel_requested = threading.Event()
@@ -2422,18 +2422,29 @@ class MainWindow(QMainWindow):
         self.status_label.setText("A iniciar…")
         self._set_busy(True)
 
+        try:
+            worker = DownloadWorker(
+                url=url,
+                destination=self.destination,
+                quality=self.quality.currentText(),
+                audio_only=self.audio_only.isChecked(),
+                allow_playlist=self.playlist_check.isChecked(),
+                container=self.video_format.currentText(),
+                download_thumbnail=self.thumbnail_check.isChecked(),
+                selected_items=selected_items,
+                output_suffix=output_suffix or "",
+            )
+        except Exception as exc:
+            message = f"Não foi possível preparar a transferência: {exc}"
+            self.status_label.setText("Não foi possível iniciar a transferência")
+            self._append_log(message)
+            self._set_busy(False)
+            self._finish_single_retry(retryable=True)
+            self._finish_active_schedule("failed", message)
+            return
+
         self.thread = QThread(self)
-        self.worker = DownloadWorker(
-            url=url,
-            destination=self.destination,
-            quality=self.quality.currentText(),
-            audio_only=self.audio_only.isChecked(),
-            allow_playlist=self.playlist_check.isChecked(),
-            container=self.video_format.currentText(),
-            download_thumbnail=self.thumbnail_check.isChecked(),
-            selected_items=selected_items,
-            output_suffix=output_suffix,
-        )
+        self.worker = worker
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self._on_progress)

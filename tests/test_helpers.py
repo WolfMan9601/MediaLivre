@@ -138,6 +138,20 @@ class UrlValidationTests(unittest.TestCase):
         self.assertEqual([line for line in logs if line.startswith("Erro:")], [])
         self.assertEqual(failures[0].count("A página boraflix.rest"), 1)
 
+    def test_download_worker_accepts_missing_or_none_output_suffix(self):
+        for suffix in (None, ""):
+            with self.subTest(suffix=suffix):
+                worker = DownloadWorker(
+                    "https://www.instagram.com/reel/ABC123/",
+                    Path(tempfile.mkdtemp()),
+                    "Melhor disponível",
+                    audio_only=False,
+                    allow_playlist=False,
+                    container="Automático",
+                    output_suffix=suffix,
+                )
+                self.assertEqual(worker.output_suffix, "")
+
     def test_facebook_reel_id_is_used_to_find_existing_output(self):
         worker = DownloadWorker(
             "https://www.facebook.com/reel/1649266366591892",
